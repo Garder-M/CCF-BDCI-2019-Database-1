@@ -6,6 +6,10 @@ struct query_result_t
     uint32_t orderkey;
     uint32_t total_expend_cent;
 
+    query_result_t() noexcept = default;
+    query_result_t(const uint32_t cent, const uint32_t key, const date_t date) noexcept 
+        : total_expend_cent(cent), orderkey(key), orderdate(date) { }
+
     FORCEINLINE bool operator >(const query_result_t& other) const noexcept {
         if (total_expend_cent > other.total_expend_cent) return true;
         if (total_expend_cent < other.total_expend_cent) return false;
@@ -21,7 +25,7 @@ struct query_t
     uint32_t q_topn;
     uint8_t q_mktid;
 
-    std::vector<query_result_t> results[g_workers_thread_count];
+    std::vector<query_result_t> results[MAX_WORKER_THREADS];
     std::vector<query_result_t> final_result;
 };
 
@@ -67,9 +71,9 @@ struct item_range_t
     const uint32_t* p_date_offset;
     date_t d_begin;
     date_t d_end;     // date range [begin, end); assume begin < end
-    std::vector<uint32_t>& q_indexs;
+    const std::vector<uint32_t>* p_q_indexs;
     uint8_t q_mktid;
-}
+};
 
 namespace
 {
@@ -77,7 +81,7 @@ namespace
     uint64_t g_mktsegment_file_size = 0;
     uint8_t g_mktid_count = 0;
     std::unordered_map<std::string, uint8_t> g_mktsegment_to_mktid { };
-    std::set<uint8_t> g_mktids { };
+    std::unordered_set<uint8_t> g_mktids { };
 
     int g_prefixsum_fd = -1;
     uint64_t g_prefixsum_file_size = 0;
@@ -85,18 +89,26 @@ namespace
     int g_items_fd = -1;
     uint64_t g_items_file_size = 0;
 
-    uint64_t* g_index_items = nullptr;
     uint32_t* g_index_prefixsum = nullptr;
 
     std::vector<query_t> g_queries_by_mktid[256];
     std::vector<std::pair<uint8_t /*mktid*/, uint32_t /*bucket_index*/> > g_all_queries;
     std::vector<date_range_t> g_date_ranges_by_mktid[256];
     std::atomic_uint32_t g_date_range_offsets_by_mktid[256];
-    mpmc_queue_t<item_range_t> g_item_range_queue;
+    mpmc_queue<item_range_t> g_item_range_queue;
 
     std::atomic_uint32_t g_synthesis_query_count { 0 };
     
     done_event* g_queries_done = nullptr;
+}
+
+FORCEINLINE size_t calc_bucket_index(const uint8_t mktid, const date_t orderdate) noexcept
+{
+    ASSERT(mktid < g_mktid_count, "BUG");
+    ASSERT(orderdate >= MIN_TABLE_DATE, "BUG");
+    ASSERT(orderdate <= MAX_TABLE_DATE, "BUG");
+
+    return (size_t)(mktid - 0) * (MAX_TABLE_DATE - MIN_TABLE_DATE + 1) + (orderdate - MIN_TABLE_DATE);
 }
 
 void load_queries()
@@ -122,14 +134,14 @@ void load_queries()
         DEBUG("query #%u: q_mktid=%u,q_orderdate=%u,q_shipdate=%u,q_topn=%u",
             qid, query.q_mktid, query.q_orderdate, query.q_shipdate, query.q_topn);
 
-        query.result.reserve(query.q_topn);
+        query.final_result.reserve(query.q_topn);
 
         // insert the involved date_range endpoints here
         const date_t d_begin = date_subtract_bounded_to_min_table_date(query.q_shipdate, SHIP_ORDER_DATE_OFFSET - 1);
         const date_t d_end = date_subtract_bounded_to_min_table_date(query.q_orderdate, 0);
         if (d_begin < d_end) {
-            dates_by_mktid[mktid].append(d_begin);
-            dates_by_mktid[mktid].append(d_end);
+            dates_by_mktid[mktid].push_back(d_begin);
+            dates_by_mktid[mktid].push_back(d_end);
         }
         // TODO: else is invalid query, left the query_result empty and skip the query
         // another invalid condition: q_shipdate < q_orderdate
@@ -150,15 +162,15 @@ void load_queries()
     
         for (size_t bucket_index = 0; bucket_index < g_queries_by_mktid[mktid].size(); ++bucket_index) {
             query_t& query = g_queries_by_mktid[mktid][bucket_index];
-            // TRACE("    query#%u: q_mktsegment=%u, q_orderdate=%04u-%02u-%02u, q_shipdate=%04u-%02u-%02u, q_limit=%u",
+            // TRACE("    query#%u: q_mktsegment=%u, q_orderdate=%04u-%02u-%02u, q_shipdate=%04u-%02u-%02u, q_topn=%u",
             //     query.q_index, query.q_mktsegment,
             //     query.q_orderdate.year(), query.q_orderdate.month(), query.q_orderdate.day(),
             //     query.q_shipdate.year(), query.q_shipdate.month(), query.q_shipdate.day(),
-            //     query.q_limit);
+            //     query.q_topn);
 
             // TODO: Reserve for results?
             //for (uint32_t t = 0; t < MAX_WORKER_THREADS; ++t) {
-            //    query.results[t].reserve(query.q_limit);
+            //    query.results[t].reserve(query.q_topn);
             //}
 
             // Fill g_all_queries
@@ -171,16 +183,16 @@ void load_queries()
             std::greater<date_t>()
         );
         const size_t size = dates_by_mktid[mktid].size();
-        g_date_ranges_by_mktid.resize(size + 1);
+        g_date_ranges_by_mktid[mktid].resize(size + 1);
         for (size_t i = 1; i < size; ++i) {
             const date_t d_begin = dates_by_mktid[mktid][i - 1];
             const date_t d_end   = dates_by_mktid[mktid][i];
-            g_date_ranges_by_mktid[mktid].d_begin = d_begin;
-            g_date_ranges_by_mktid[mktid].d_end   = d_end;
+            g_date_ranges_by_mktid[mktid][i].d_begin = d_begin;
+            g_date_ranges_by_mktid[mktid][i].d_end   = d_end;
             for (size_t j = 0; j < g_queries_by_mktid[mktid].size(); ++j) {
                 if (date_subtract_bounded_to_min_table_date(g_queries_by_mktid[mktid][j].q_orderdate, 0) >= d_end && 
                     date_subtract_bounded_to_min_table_date(g_queries_by_mktid[mktid][j].q_shipdate, SHIP_ORDER_DATE_OFFSET - 1) <= d_begin) {
-                    g_date_ranges_by_mktid[mktid].q_indexs.append(g_queries_by_mktid[mktid][j].q_index);
+                    g_date_ranges_by_mktid[mktid][i].q_indexs.push_back(g_queries_by_mktid[mktid][j].q_index);
                 }
             }
         }
@@ -188,7 +200,7 @@ void load_queries()
 
 }
 
-void fn_loader_thread(const uint32_t tid) noexcept
+void fn_loader_thread_use_index(const uint32_t tid) noexcept
 {
     DEBUG("[%u] loader started", tid);
     constexpr uint64_t step_size = 1048576 * 16 - 4096;
@@ -238,10 +250,10 @@ void fn_loader_thread(const uint32_t tid) noexcept
                     }
                     i_range.i_end = i_range.i_begin + size;
                     // i_range.map_size = size;
-                    i_range.p_date_offset = &g_date_offsets_by_mktid[mktid][l];
+                    i_range.p_date_offset = &g_index_prefixsum[calc_bucket_index(mktid, l)];
                     i_range.d_begin = l;
                     i_range.d_end = r;
-                    i_range.q_indexs = d_range.q_indexs;
+                    i_range.p_q_indexs = &(d_range.q_indexs);
                     i_range.q_mktid = mktid;
                     g_item_range_queue.push(i_range);
                     // g_mapped_queues_by_mktid[mktid].push(i_range);
@@ -253,7 +265,7 @@ void fn_loader_thread(const uint32_t tid) noexcept
 
     g_loader_sync_barrier.sync();
     if (tid == 0) {
-        g_item_range_queue.mark_finish_push();
+        g_item_range_queue.mark_push_finish();
     }
 
     DEBUG("[%u] loader done", tid);
@@ -261,7 +273,7 @@ void fn_loader_thread(const uint32_t tid) noexcept
 
 void worker_load_multi_part(const uint32_t tid) {
     item_range_t i_range;
-    while (g_item_range_queue.pop(i_range)) {
+    while (g_item_range_queue.pop(&i_range)) {
         ASSERT(i_range.i_begin != nullptr, "[%u] BUG: pop: i_range.i_begin == nullptr", tid);
         ASSERT(i_range.i_end   != nullptr, "[%u] BUG: pop: i_range.i_end == nullptr", tid);
     
@@ -280,8 +292,9 @@ void worker_load_multi_part(const uint32_t tid) {
         uint32_t curr_orderkey = 0;
         const auto query_by_same_orderkey = [&]() {
             ASSERT(curr_item_count > 0, "BUG... curr_item_count is 0");
-            for (uint32_t q_index : i_range.q_indexs) {
-                const query_t& query = g_queries_by_mktid[mktid][g_all_queries[q_index].second];
+            const std::vector<uint32_t>& q_indexs = *(i_range.p_q_indexs);
+            for (uint32_t q_index : q_indexs) {
+                query_t& query = g_queries_by_mktid[mktid][g_all_queries[q_index].second];
                 ASSERT(curr_orderdate < query.q_orderdate, "BUG... curr_orderdate >= query.q_orderdate, tid = %d", tid);
                 uint32_t total_expend_cent = 0;
                 bool matched = false;
@@ -294,9 +307,9 @@ void worker_load_multi_part(const uint32_t tid) {
 
                 if (matched) {
                     std::vector<query_result_t>& result = query.results[tid];
-                    if (result.size() < query.q_limit) {
+                    if (result.size() < query.q_topn) {
                         result.emplace_back(total_expend_cent, curr_orderkey, curr_orderdate);
-                        if (result.size() == query.q_limit) {
+                        if (result.size() == query.q_topn) {
                             std::make_heap(result.begin(), result.end(), std::greater<query_result_t>());
                         }
                     }
@@ -309,9 +322,10 @@ void worker_load_multi_part(const uint32_t tid) {
                     }
                 }
             }
+        };
 
         for (; p < i_range.i_end; ++p) {
-            if (*p.orderkey() != curr_orderkey) {
+            if ((*p).orderkey() != curr_orderkey) {
                 query_by_same_orderkey();
                 // update the curr_orderdate for the new orderkey
                 while (UNLIKELY(*p_date_offset - *(i_range.p_date_offset) <= (uint32_t)(p - i_range.i_begin))) {
@@ -319,7 +333,7 @@ void worker_load_multi_part(const uint32_t tid) {
                     curr_orderdate = curr_orderdate + 1;
                 }
                 // ++curr_fake_orderkey;
-                curr_orderkey = *p.orderkey;
+                curr_orderkey = (*p).orderkey();
                 curr_item_count = 0;
             }
             curr_items[curr_item_count] = *p;
@@ -328,7 +342,6 @@ void worker_load_multi_part(const uint32_t tid) {
         query_by_same_orderkey();
 
         C_CALL(munmap((void*)i_range.i_begin, (size_t)((i_range.i_end - i_range.i_begin) * sizeof(item_t))));
-        }
     }
 }
 
@@ -343,11 +356,11 @@ void worker_final_synthesis(const uint32_t /*tid*/) noexcept
         query_t& query = g_queries_by_mktid[mktid][bucket_index];
         auto& final_result = query.final_result;
 
-        for (uint32_t t = 0; t < g_workers_thread_count; ++t) {
+        for (uint32_t t = 0; t < g_worker_thread_count; ++t) {
             for (const query_result_t& result : query.results[t]) {
-                if (final_result.size() < query.q_limit) {
+                if (final_result.size() < query.q_topn) {
                     final_result.emplace_back(result);
-                    if (final_result.size() == query.q_limit) {
+                    if (final_result.size() == query.q_topn) {
                         std::make_heap(final_result.begin(), final_result.end(), std::greater<query_result_t>());
                     }
                 }
@@ -425,18 +438,18 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 
     //g_workers_barrier_external.sync();  // sync.ext@0
     {
-        [[maybe_unused]] timer tmr;
-        DEBUG("[%u] worker_load_multi_part(): starts", tid);
+        // [[maybe_unused]] timer tmr;
+        // DEBUG("[%u] worker_load_multi_part(): starts", tid);
         worker_load_multi_part(tid);
-        DEBUG("[%u] worker_load_multi_part(): %.3lf msec", tid, tmr.elapsed_msec());
+        // DEBUG("[%u] worker_load_multi_part(): %.3lf msec", tid, tmr.elapsed_msec());
     }
     g_worker_sync_barrier.sync();  // sync
     
     {
-        [[maybe_unused]] timer tmr;
-        DEBUG("[%u] worker final synthesis: starts", tid);
+        // [[maybe_unused]] timer tmr;
+        // DEBUG("[%u] worker final synthesis: starts", tid);
         worker_final_synthesis(tid);
-        DEBUG("[%u] worker final synthesis: %.3lf msec", tid, tmr.elapsed_msec());
+        // DEBUG("[%u] worker final synthesis: %.3lf msec", tid, tmr.elapsed_msec());
     }
 
     DEBUG("[%u] worker done", tid);
@@ -448,7 +461,7 @@ void main_thread_use_index() noexcept
         g_queries_done[query_idx].wait_done();
 
         // print query
-        query_t& query = g_all_queries[query_idx];
+        query_t& query = g_queries_by_mktid[g_all_queries[query_idx].first][g_all_queries[query_idx].second];
         printf("l_orderkey|o_orderdate|revenue\n");
         for (const query_result_t& line : query.final_result) {
             const auto ymd = date_get_ymd(line.orderdate);

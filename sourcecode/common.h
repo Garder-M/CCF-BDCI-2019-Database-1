@@ -80,6 +80,7 @@ void create_index_initialize() noexcept;
 void main_thread_use_index() noexcept;
 void fn_worker_thread_use_index(const uint32_t tid) noexcept;
 void use_index_initialize() noexcept;
+void fn_loader_thread_use_index(const uint32_t tid) noexcept;
 
 
 #endif  // !defined(_BDCI19_COMMON_H_INCLUDED_)
