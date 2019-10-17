@@ -21,7 +21,8 @@ struct query_t
     uint32_t q_topn;
     uint8_t q_mktid;
 
-    std::vector<query_result_t> result;
+    std::vector<query_result_t> results[g_workers_thread_count];
+    std::vector<query_result_t> final_result;
 };
 
 #define SHIP_ORDER_DATE_OFFSET 128
@@ -33,9 +34,30 @@ struct date_range_t
     // TODO: copy constructor and operator=() for q_indexs; or replace it completely with pointer(requires extra q_num parameter)
 };
 
+// struct item_t
+// {
+//     uint32_t _value;
+
+//     // item_t() noexcept = default;
+//     // item_t(uint32_t value) noexcept { _value = value; }
+//     // FORCEINLINE item_t& operator=(uint32_t value) noexcept { _value = value; return *this; }
+//     // FORCEINLINE item_t& operator=(item_t& right) noexcept { _value = right._value; return *this; }
+//     FORCEINLINE uint32_t order_tag() const noexcept { return (uint32_t)(_value & 0x80000000) >> 31; }
+//     FORCEINLINE uint32_t shipdate_offset() const noexcept { return (uint32_t)(_value & 0x7f000000) >> 24; }
+//     FORCEINLINE uint32_t cent() const noexcept { return _value & 0xffffff; }
+// };
+
 struct item_t
 {
+    uint64_t _value;
 
+    // item_t() noexcept = default;
+    // item_t(uint32_t value) noexcept { _value = value; }
+    // FORCEINLINE item_t& operator=(uint32_t value) noexcept { _value = value; return *this; }
+    // FORCEINLINE item_t& operator=(item_t& right) noexcept { _value = right._value; return *this; }
+    FORCEINLINE uint64_t orderkey() const noexcept { return (uint32_t)_value; }
+    FORCEINLINE uint64_t shipdate_offset() const noexcept { return (uint32_t)((uint32_t)(_value >> 32) & 0x7f000000) >> 24; }
+    FORCEINLINE uint64_t cent() const noexcept { return (uint32_t)(_value >> 32) & 0xffffff; }
 };
 
 struct item_range_t
@@ -66,23 +88,22 @@ namespace
     uint64_t* g_index_items = nullptr;
     uint32_t* g_index_prefixsum = nullptr;
 
-    // std::vector<query_t> g_queries { };
-    // done_event* g_queries_done = nullptr;
-    // std::atomic_uint32_t g_queries_curr { 0 };
     std::vector<query_t> g_queries_by_mktid[256];
-    std::pair<uint32_t /*mktid*/, uint32_t /*bucket_index*/> g_all_queries[256];
+    std::vector<std::pair<uint8_t /*mktid*/, uint32_t /*bucket_index*/> > g_all_queries;
     std::vector<date_range_t> g_date_ranges_by_mktid[256];
-    static std::atomic_uint32_t g_date_range_offsets_by_mktid[256];
+    std::atomic_uint32_t g_date_range_offsets_by_mktid[256];
     mpmc_queue_t<item_range_t> g_item_range_queue;
 
-    // require to support in main.cpp or common.h
-    threads_barrier_t g_loaders_barrier;
+    std::atomic_uint32_t g_synthesis_query_count { 0 };
+    
+    done_event* g_queries_done = nullptr;
 }
 
 void load_queries()
 {
     std::vector<date_t> dates_by_mktid[256];
-    g_queries.resize(g_query_count);
+    g_queries_done = new done_event[g_query_count];
+    g_all_queries.resize(g_query_count);
     for (uint32_t qid = 0; qid < g_query_count; ++qid) {
         const auto it = g_mktsegment_to_mktid.find(g_argv_queries[4 * qid + 0]);
         ASSERT(it != g_mktsegment_to_mktid.end(), "TODO: deal with unknown mktsegment in query");  // TODO
@@ -230,7 +251,7 @@ void fn_loader_thread(const uint32_t tid) noexcept
         }
     }
 
-    g_loaders_barrier.sync();
+    g_loader_sync_barrier.sync();
     if (tid == 0) {
         g_item_range_queue.mark_finish_push();
     }
@@ -238,12 +259,204 @@ void fn_loader_thread(const uint32_t tid) noexcept
     DEBUG("[%u] loader done", tid);
 }
 
-void fn_worker_thread(const uint32_t tid) noexcept
-{
+void worker_load_multi_part(const uint32_t tid) {
+    item_range_t i_range;
+    while (g_item_range_queue.pop(i_range)) {
+        ASSERT(i_range.i_begin != nullptr, "[%u] BUG: pop: i_range.i_begin == nullptr", tid);
+        ASSERT(i_range.i_end   != nullptr, "[%u] BUG: pop: i_range.i_end == nullptr", tid);
+    
+        item_t curr_items[32];
+        // adjust the head curr_orderdate to the precise orderdate, skipping bubble orderdate
+        date_t curr_orderdate = i_range.d_begin;
+        const item_t* p = i_range.i_begin;
+        const uint32_t* p_date_offset = i_range.p_date_offset + 1;
+        while (*p_date_offset - *(i_range.p_date_offset) <= (uint32_t)(p - i_range.i_begin)) {
+            ++p_date_offset;
+            curr_orderdate = curr_orderdate + 1;
+        }
 
+        const uint8_t mktid = i_range.q_mktid;
+        uint32_t curr_item_count = 0;
+        uint32_t curr_orderkey = 0;
+        const auto query_by_same_orderkey = [&]() {
+            ASSERT(curr_item_count > 0, "BUG... curr_item_count is 0");
+            for (uint32_t q_index : i_range.q_indexs) {
+                const query_t& query = g_queries_by_mktid[mktid][g_all_queries[q_index].second];
+                ASSERT(curr_orderdate < query.q_orderdate, "BUG... curr_orderdate >= query.q_orderdate, tid = %d", tid);
+                uint32_t total_expend_cent = 0;
+                bool matched = false;
+                for (uint32_t i = 0; i < curr_item_count; ++i) {
+                    if (curr_orderdate + curr_items[i].shipdate_offset() > query.q_shipdate) {
+                        total_expend_cent += curr_items[i].cent();
+                        matched = true;
+                    }
+                }
+
+                if (matched) {
+                    std::vector<query_result_t>& result = query.results[tid];
+                    if (result.size() < query.q_limit) {
+                        result.emplace_back(total_expend_cent, curr_orderkey, curr_orderdate);
+                        if (result.size() == query.q_limit) {
+                            std::make_heap(result.begin(), result.end(), std::greater<query_result_t>());
+                        }
+                    }
+                    else {
+                        if (UNLIKELY(total_expend_cent > result.begin()->total_expend_cent)) {
+                            std::pop_heap(result.begin(), result.end(), std::greater<query_result_t>());
+                            *result.rbegin() = query_result_t(total_expend_cent, curr_orderkey, curr_orderdate);
+                            std::push_heap(result.begin(), result.end(), std::greater<query_result_t>());
+                        }
+                    }
+                }
+            }
+
+        for (; p < i_range.i_end; ++p) {
+            if (*p.orderkey() != curr_orderkey) {
+                query_by_same_orderkey();
+                // update the curr_orderdate for the new orderkey
+                while (UNLIKELY(*p_date_offset - *(i_range.p_date_offset) <= (uint32_t)(p - i_range.i_begin))) {
+                    ++p_date_offset;
+                    curr_orderdate = curr_orderdate + 1;
+                }
+                // ++curr_fake_orderkey;
+                curr_orderkey = *p.orderkey;
+                curr_item_count = 0;
+            }
+            curr_items[curr_item_count] = *p;
+            ++curr_item_count;
+        }
+        query_by_same_orderkey();
+
+        C_CALL(munmap((void*)i_range.i_begin, (size_t)((i_range.i_end - i_range.i_begin) * sizeof(item_t))));
+        }
+    }
+}
+
+void worker_final_synthesis(const uint32_t /*tid*/) noexcept
+{
+    while (true) {
+        const uint32_t query_idx = g_synthesis_query_count++;
+        if (query_idx >= g_query_count) return;
+
+        const uint8_t mktid = g_all_queries[query_idx].first;
+        const uint32_t bucket_index = g_all_queries[query_idx].second;
+        query_t& query = g_queries_by_mktid[mktid][bucket_index];
+        auto& final_result = query.final_result;
+
+        for (uint32_t t = 0; t < g_workers_thread_count; ++t) {
+            for (const query_result_t& result : query.results[t]) {
+                if (final_result.size() < query.q_limit) {
+                    final_result.emplace_back(result);
+                    if (final_result.size() == query.q_limit) {
+                        std::make_heap(final_result.begin(), final_result.end(), std::greater<query_result_t>());
+                    }
+                }
+                else {
+                    if (UNLIKELY(result > *final_result.begin())) {
+                        std::pop_heap(final_result.begin(), final_result.end(), std::greater<query_result_t>());
+                        *final_result.rbegin() = result;
+                        std::push_heap(final_result.begin(), final_result.end(), std::greater<query_result_t>());
+                    }
+                }
+            }
+        }
+
+        std::sort(final_result.begin(), final_result.end(), std::greater<query_result_t>());
+        g_queries_done[query_idx].mark_done();
+        // // TODO: translate the fake_orderkey to the real_orderkey, according to the mktsegment and recorded orderkey file
+
+    }
+}
+
+void use_index_initialize() noexcept
+{
+    // Open index files
+    {
+        const auto &open_file = [](const char *const path, int *const fd, uint64_t *const file_size) noexcept {
+            *fd = C_CALL(openat(g_index_directory_fd, path, O_RDONLY | O_CLOEXEC));
+            struct stat64 st;
+            C_CALL(fstat64(*fd, &st));
+            *file_size = st.st_size;
+            TRACE("openat %s: fd = %d, size = %lu", path, *fd, *file_size);
+        };
+
+        open_file("mktsegment", &g_mktsegment_fd, &g_mktsegment_file_size);
+        open_file("prefixsum", &g_prefixsum_fd, &g_prefixsum_file_size);
+        open_file("items", &g_items_fd, &g_items_file_size);
+    }
+
+    // Load index files: load mktsegment
+    {
+        const void* ptr = mmap_parallel(g_mktsegment_file_size, 1, PROT_READ, MAP_PRIVATE, g_mktsegment_fd);
+        const char* p = (const char*)ptr;
+        g_mktid_count = *(uint8_t*)(p++);
+        for (uint8_t mktid = 0; mktid < g_mktid_count; ++mktid) {
+            const uint8_t length = *(uint8_t*)(p++);
+            g_mktsegment_to_mktid[std::string(p, length)] = mktid;
+            DEBUG("loaded mktsegment: %.*s -> %u", length, p, mktid);
+            p += length;
+        }
+    }
+
+    // Load queries
+    {
+        load_queries();
+    }
+
+
+    // Load index files: load prefixsum
+    {
+        ASSERT(g_prefixsum_file_size == sizeof(uint32_t) * g_mktid_count * (MAX_TABLE_DATE - MIN_TABLE_DATE + 1),
+            "BUG: broken index?");
+
+        g_index_prefixsum = (uint32_t*)mmap_parallel(
+            g_prefixsum_file_size,
+            1,
+            PROT_READ,
+            MAP_PRIVATE,
+            g_prefixsum_fd);
+        DEBUG("g_index_prefixsum: %p", g_index_prefixsum);
+    }
+}
+
+void fn_worker_thread_use_index(const uint32_t tid) noexcept
+{
+    DEBUG("[%u] worker started", tid);
+
+    //g_workers_barrier_external.sync();  // sync.ext@0
+    {
+        [[maybe_unused]] timer tmr;
+        DEBUG("[%u] worker_load_multi_part(): starts", tid);
+        worker_load_multi_part(tid);
+        DEBUG("[%u] worker_load_multi_part(): %.3lf msec", tid, tmr.elapsed_msec());
+    }
+    g_worker_sync_barrier.sync();  // sync
+    
+    {
+        [[maybe_unused]] timer tmr;
+        DEBUG("[%u] worker final synthesis: starts", tid);
+        worker_final_synthesis(tid);
+        DEBUG("[%u] worker final synthesis: %.3lf msec", tid, tmr.elapsed_msec());
+    }
+
+    DEBUG("[%u] worker done", tid);
 }
 
 void main_thread_use_index() noexcept
 {
+    for (uint32_t query_idx = 0; query_idx < g_query_count; ++query_idx) {
+        g_queries_done[query_idx].wait_done();
 
+        // print query
+        query_t& query = g_all_queries[query_idx];
+        printf("l_orderkey|o_orderdate|revenue\n");
+        for (const query_result_t& line : query.final_result) {
+            const auto ymd = date_get_ymd(line.orderdate);
+            printf("%u|%u-%02u-%02u|%u.%02u\n",
+                line.orderkey,
+                std::get<0>(ymd), std::get<1>(ymd), std::get<2>(ymd),
+                line.total_expend_cent / 100, line.total_expend_cent % 100);
+        }
+    }
+    delete [] g_queries_done;
 }

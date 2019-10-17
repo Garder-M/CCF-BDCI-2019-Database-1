@@ -60,7 +60,9 @@ inline const char* const* g_argv_queries;
 inline uint32_t g_loader_thread_count;
 inline uint32_t g_worker_thread_count;
 inline std::vector<std::thread> g_worker_threads;
+inline std::vector<std::thread> g_loader_threads;
 inline sync_barrier g_worker_sync_barrier;
+inline sync_barrier g_loader_sync_barrier;
 
 
 
