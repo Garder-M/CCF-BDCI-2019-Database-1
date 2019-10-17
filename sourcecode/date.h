@@ -102,6 +102,12 @@ FORCEINLINE constexpr date_t date_subtract_bounded_to_min_table_date(const date_
     return date - subtract;
 }
 
+FORCEINLINE constexpr date_t date_add_bounded_to_max_table_date(const date_t date, const uint16_t add) noexcept
+{
+    if (UNLIKELY(date + add > MAX_TABLE_DATE)) return MAX_TABLE_DATE;
+
+    return date + add;
+}
 
 
 //==============================================================================

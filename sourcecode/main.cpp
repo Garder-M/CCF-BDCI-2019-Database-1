@@ -38,10 +38,11 @@ int main(int argc, char* argv[])
         DEBUG("free size for /dev/shm: %lu", free_size);
 
         char index_dir[32];
-        if (free_size >= (uint64_t)1048576 * 1024 * 6) {  // At least 6 GB free space in /dev/shm
-            DEBUG("/dev/shm is large enough - use it for index files");
-            snprintf(index_dir, 32, "/dev/shm/index_%08x", index_hash_u32);
-        }
+        // if (free_size >= (uint64_t)1048576 * 1024 * 6) {  // At least 6 GB free space in /dev/shm
+        //     DEBUG("/dev/shm is large enough - use it for index files");
+        //     snprintf(index_dir, 32, "/dev/shm/index_%08x", index_hash_u32);
+        // }
+        if (false) { }
         else {
             DEBUG("/dev/shm is too small - use current working directory for index files");
             snprintf(index_dir, 32, "./index_%08x", index_hash_u32);
