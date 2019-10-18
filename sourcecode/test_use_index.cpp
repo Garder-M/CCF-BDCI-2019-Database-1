@@ -61,9 +61,9 @@ struct item_t
     // item_t(uint32_t value) noexcept { _value = value; }
     // FORCEINLINE item_t& operator=(uint32_t value) noexcept { _value = value; return *this; }
     // FORCEINLINE item_t& operator=(item_t& right) noexcept { _value = right._value; return *this; }
-    FORCEINLINE uint64_t orderkey() const noexcept { return (uint32_t)_value; }
-    FORCEINLINE uint64_t shipdate_offset() const noexcept { return (uint32_t)((uint32_t)(_value >> 32) & 0x7f000000) >> 24; }
-    FORCEINLINE uint64_t cent() const noexcept { return (uint32_t)(_value >> 32) & 0xffffff; }
+    FORCEINLINE uint32_t orderkey() const noexcept { return (uint32_t)_value; }
+    FORCEINLINE uint32_t shipdate_offset() const noexcept { return (uint32_t)(_value >> 56); }
+    FORCEINLINE uint32_t cent() const noexcept { return (uint32_t)(_value >> 32) & 0xffffff; }
 };
 static_assert(sizeof(item_t) == 8);
 
@@ -180,7 +180,7 @@ void load_queries()
             //}
 
             // Fill g_all_queries
-            g_all_queries[query.q_index] = std::make_pair((uint32_t)mktid, (uint32_t)bucket_index);
+            g_all_queries[query.q_index] = std::make_pair((uint8_t)mktid, (uint32_t)bucket_index);
         }
 
         std::sort(
@@ -274,6 +274,7 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
                     i_range.q_mktid = mktid;
                     g_item_range_queue.push(i_range);
                     // g_mapped_queues_by_mktid[mktid].push(i_range);
+                    DEBUG("loader%u push i_range, date[%u,%u){ref[%u,%u)}, i_range[%p,%p), q_index p%p size%u", tid, i_range.d_begin,i_range.d_end, l,r, i_range.i_begin,i_range.i_end, i_range.p_q_indexs, (i_range.p_q_indexs)->size());
                     l = r;
                 }
             }
@@ -294,20 +295,22 @@ void worker_load_multi_part(const uint32_t tid) {
         ASSERT(i_range.i_begin != nullptr, "[%u] BUG: pop: i_range.i_begin == nullptr", tid);
         ASSERT(i_range.i_end   != nullptr, "[%u] BUG: pop: i_range.i_end == nullptr", tid);
         ASSERT(i_range.p_q_indexs != nullptr, "[%u] BUG: pop: i_range.p_q_indexs == nullptr", tid);
+        DEBUG("worker%u fetch i_range, date[%u,%u), i_range[%p,%p), q_indexes p%p size%u", tid, i_range.d_begin,i_range.d_end, i_range.i_begin,i_range.i_end, i_range.p_q_indexs, (i_range.p_q_indexs)->size());
     
         item_t curr_items[32];
         // adjust the head curr_orderdate to the precise orderdate, skipping bubble orderdate
         date_t curr_orderdate = i_range.d_begin;
         const item_t* p = i_range.i_begin;
         const uint32_t* p_date_offset = i_range.p_date_offset + 1;
-        while (*p_date_offset - *(i_range.p_date_offset) <= (uint64_t)(p - i_range.i_begin)) {
+        while (*p_date_offset - *(i_range.p_date_offset) <= (uint32_t)(p - i_range.i_begin)) {
             ++p_date_offset;
             curr_orderdate = curr_orderdate + 1;
-            if (curr_orderdate >= i_range.d_end) {
-                // goto PASS;
-                p = i_range.i_end;
-                break;
-            }
+            // if (curr_orderdate >= i_range.d_end) {
+            //     // goto PASS;
+            //     p = i_range.i_end;
+            //     break;
+            // }
+            ASSERT(curr_orderdate < i_range.d_end, "curr_orderdate >= i_range.d_end");
         }
 
         const uint8_t mktid = i_range.q_mktid;
@@ -321,6 +324,7 @@ void worker_load_multi_part(const uint32_t tid) {
                 ASSERT(mktid == g_all_queries[q_index].first, "BUG... mktid mismatch");
                 query_t& query = g_queries_by_mktid[mktid][g_all_queries[q_index].second];
                 ASSERT(curr_orderdate < query.q_orderdate, "BUG... curr_orderdate >= query.q_orderdate, tid = %d", tid);
+                TRACE("q_index=%u, curr_orderdate=%u, q_shipdate=%u", q_index, curr_orderdate, query.q_shipdate);
                 uint32_t total_expend_cent = 0;
                 bool matched = false;
                 for (uint32_t i = 0; i < curr_item_count; ++i) {
@@ -355,7 +359,7 @@ void worker_load_multi_part(const uint32_t tid) {
             if ((*p).orderkey() != curr_orderkey) {
                 query_by_same_orderkey();
                 // update the curr_orderdate for the new orderkey
-                while (UNLIKELY(*p_date_offset - *(i_range.p_date_offset) <= (uint64_t)(p - i_range.i_begin))) {
+                while (UNLIKELY(*p_date_offset - *(i_range.p_date_offset) <= (uint32_t)(p - i_range.i_begin))) {
                     ++p_date_offset;
                     curr_orderdate = curr_orderdate + 1;
                     // if (curr_orderdate >= i_range.d_end) {
@@ -483,9 +487,7 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
     {
         // [[maybe_unused]] timer tmr;
         // DEBUG("[%u] worker final synthesis: starts", tid);
-        if (tid < g_query_count) {
-            worker_final_synthesis(tid);
-        }
+        worker_final_synthesis(tid);
         // DEBUG("[%u] worker final synthesis: %.3lf msec", tid, tmr.elapsed_msec());
     }
 
