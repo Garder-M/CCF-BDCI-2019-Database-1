@@ -101,7 +101,7 @@ namespace
     std::vector<query_t> g_queries_by_mktid[256];
     std::vector<std::pair<uint8_t /*mktid*/, uint32_t /*bucket_index*/> > g_all_queries;
     std::vector<date_range_t> g_date_ranges_by_mktid[256];
-    constexpr uint64_t g_item_range_step_size = 1048576 * 16 - 4096;
+    constexpr uint64_t g_item_range_step_size = 1048576 * 4 - 4096;
     uint64_t g_max_item_ranges_count = 0;
     std::atomic_uint32_t g_date_range_offsets_by_mktid[256];
     mpmc_queue<item_range_t> g_item_range_queue;
@@ -250,7 +250,8 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
             //     /*unsupported...*/begin_offset * sizeof(item_t)
             // );
             item_range_t i_range;
-            for (date_t l = d_range.d_begin, r = d_range.d_begin + 1; r < d_range.d_end; r = r + 1) {
+            date_t r = (d_range.d_begin + 1 >= d_range.d_end) ? d_range.d_begin : (d_range.d_begin + 1);
+            for (date_t l = d_range.d_begin; r < d_range.d_end; r = r + 1) {
                 bool flag = false;
                 if (UNLIKELY(r + 1 >= d_range.d_end)) {
                     r = d_range.d_end;
