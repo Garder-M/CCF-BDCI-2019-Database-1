@@ -96,6 +96,7 @@ namespace
 
     uint32_t* g_index_prefixsum = nullptr;
     uint32_t* g_q_index_buffer = nullptr;
+    uint32_t* g_0_index_prefixsum = nullptr;
 
     std::vector<query_t> g_queries_by_mktid[256];
     std::vector<std::pair<uint8_t /*mktid*/, uint32_t /*bucket_index*/> > g_all_queries;
@@ -158,6 +159,8 @@ void load_queries()
         // TODO: the static topn range must be considered if possible
     }
 
+    g_q_index_buffer = new uint32_t[g_query_count * max_date_ranges_count];
+    uint32_t l = 0, r = 0;
     for (auto mktid : g_mktids) {
         std::sort(
             g_queries_by_mktid[mktid].begin(),
@@ -172,6 +175,7 @@ void load_queries()
     
         for (size_t bucket_index = 0; bucket_index < g_queries_by_mktid[mktid].size(); ++bucket_index) {
             query_t& query = g_queries_by_mktid[mktid][bucket_index];
+            ASSERT(query.q_mktid == mktid, "%u vs %u", query.q_mktid, mktid);
             // TRACE("    query#%u: q_mktsegment=%u, q_orderdate=%04u-%02u-%02u, q_shipdate=%04u-%02u-%02u, q_topn=%u",
             //     query.q_index, query.q_mktsegment,
             //     query.q_orderdate.year(), query.q_orderdate.month(), query.q_orderdate.day(),
@@ -194,25 +198,25 @@ void load_queries()
         );
         const size_t size = dates_by_mktid[mktid].size();
         g_date_ranges_by_mktid[mktid].resize(size + 1);
-        g_q_index_buffer = new uint32_t[g_query_count * max_date_ranges_count];
-        uint32_t l = 0, r = 0;
         for (size_t i = 1; i < size; ++i) {
             const date_t d_begin = dates_by_mktid[mktid][i - 1];
             const date_t d_end   = dates_by_mktid[mktid][i];
+            if (d_end <= d_begin) continue;
             g_date_ranges_by_mktid[mktid][i].d_begin = d_begin;
             g_date_ranges_by_mktid[mktid][i].d_end   = d_end;
-            DEBUG("add date range [%u, %u)", d_begin, d_end);
+            DEBUG("add date range [%u, %u) with mktid %u", d_begin, d_end, mktid);
             for (const query_t& query : g_queries_by_mktid[mktid]) {
                 if (date_subtract_bounded_to_min_table_date(query.q_orderdate, 0) >= d_end && date_subtract_bounded_to_min_table_date(query.q_shipdate, SHIP_ORDER_DATE_OFFSET - 1) <= d_begin) {
                     // g_date_ranges_by_mktid[mktid][i].q_indexs.push_back(query.q_index);
                     g_q_index_buffer[r] = query.q_index;
                     ++r;
                     g_max_item_ranges_count += (g_index_prefixsum[calc_bucket_index(mktid, d_end)] - g_index_prefixsum[calc_bucket_index(mktid, d_begin)]) / g_item_range_step_size + 1;
-                    DEBUG("add query %u to date range [%u, %u)", query.q_index, d_begin, d_end);
+                    DEBUG("add query %u to date range [%u, %u) with mktid %u", query.q_index, d_begin, d_end, mktid);
                 }
             }
             g_date_ranges_by_mktid[mktid][i].q_index_begin = l;
             g_date_ranges_by_mktid[mktid][i].q_index_end = r;
+            DEBUG("date_range [%u,%u) has q_index [%u,%u) with mktid%u", d_begin,d_end, l,r, mktid);
             l = r;
         }
     }
@@ -246,16 +250,24 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
             //     /*unsupported...*/begin_offset * sizeof(item_t)
             // );
             item_range_t i_range;
-            for (date_t l = d_range.d_begin, r = d_range.d_begin; r < d_range.d_end; r = r + 1) {
+            for (date_t l = d_range.d_begin, r = d_range.d_begin + 1; r < d_range.d_end; r = r + 1) {
                 bool flag = false;
                 if (UNLIKELY(r + 1 >= d_range.d_end)) {
                     r = d_range.d_end;
                     flag = true;
                 }
-                const uint64_t l_offset = g_index_prefixsum[calc_bucket_index(mktid, l)];
+                const uint32_t l_bucket_index = calc_bucket_index(mktid, l);
+                uint64_t l_offset;
+                if (LIKELY(l_bucket_index > 0)) {
+                    l_offset = g_index_prefixsum[l_bucket_index - 1];
+                }
+                else {
+                    l_offset = 0;
+                }
+                // ASSERT(l_bucket_index > 0, "l_bucket_index <= 0");
                 const uint64_t l_aligned_offset = l_offset & item_page_align_mask;
                 ASSERT(l_offset >= l_aligned_offset, "BUG... l_offset < l_aligned_offset");
-                const uint64_t r_offset = g_index_prefixsum[calc_bucket_index(mktid, r)];
+                const uint64_t r_offset = g_index_prefixsum[calc_bucket_index(mktid, r) - 1];
                 uint64_t size = r_offset - l_offset;
                 if (size >= g_item_range_step_size) {
                     flag = true;
@@ -278,7 +290,16 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
                     i_range.i_begin = i_range.i_aligned_begin + (l_offset - l_aligned_offset);
                     i_range.i_end = i_range.i_aligned_begin + size;
                     // i_range.map_size = size;
-                    i_range.p_date_offset = &g_index_prefixsum[calc_bucket_index(mktid, l)];
+                    // TODO: not correct for bucket == 0...
+                    if (LIKELY(l_bucket_index > 0)) {
+                        i_range.p_date_offset = &g_index_prefixsum[l_bucket_index - 1];
+                    }
+                    else {
+                        g_0_index_prefixsum = new uint32_t[r - l + 1];
+                        g_0_index_prefixsum[0] = 0;
+                        memcpy((void*)(g_0_index_prefixsum + 1), (void*)(g_index_prefixsum + l_bucket_index), (r-l) * sizeof(uint32_t));
+                        i_range.p_date_offset = g_0_index_prefixsum;
+                    }
                     i_range.d_begin = l;
                     i_range.d_end = r;
                     // i_range.p_q_indexs = &(d_range.q_indexs);
@@ -335,7 +356,7 @@ void worker_load_multi_part(const uint32_t tid) {
             // const std::vector<uint32_t>& q_indexs = *(i_range.p_q_indexs);
             for (uint32_t l = i_range.q_index_begin; l < i_range.q_index_end; ++l) {
                 const uint32_t q_index = g_q_index_buffer[l];
-                ASSERT(mktid == g_all_queries[q_index].first, "BUG... mktid mismatch");
+                ASSERT(mktid == g_all_queries[q_index].first, "%u vs %u, q_index_offset=%u", mktid, g_all_queries[q_index].first, l);
                 query_t& query = g_queries_by_mktid[mktid][g_all_queries[q_index].second];
                 ASSERT(curr_orderdate < query.q_orderdate, "BUG... curr_orderdate >= query.q_orderdate, tid = %d", tid);
                 // TRACE("q_index=%u, curr_orderdate=%u, q_shipdate=%u", q_index, curr_orderdate, query.q_shipdate);
@@ -528,4 +549,7 @@ void main_thread_use_index() noexcept
     }
     delete [] g_queries_done;
     delete [] g_q_index_buffer;
+    if (g_0_index_prefixsum != nullptr) {
+        delete [] g_0_index_prefixsum;
+    }
 }

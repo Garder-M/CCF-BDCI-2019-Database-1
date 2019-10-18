@@ -103,7 +103,7 @@ int main(int argc, char* argv[])
         for (uint32_t tid = 0; tid < g_loader_thread_count; ++tid) {
             g_loader_threads.emplace_back(fn_loader_thread_use_index, tid);
         }
-        for (std::thread& thr : g_loader_threads) thr.join();
+        // for (std::thread& thr : g_loader_threads) thr.join();
     }
 
 
@@ -120,6 +120,8 @@ int main(int argc, char* argv[])
     // Call main function
     (g_is_creating_index ? main_thread_create_index : main_thread_use_index)();
 
+    // Wait for loader threads
+    for (std::thread& thr : g_loader_threads) thr.join();
     // Wait for worker threads
     for (std::thread& thr : g_worker_threads) thr.join();
 
