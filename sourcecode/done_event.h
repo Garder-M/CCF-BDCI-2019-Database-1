@@ -31,7 +31,10 @@ public:
     {
         if (is_done()) return;
 
-        _done.store(1);
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _done.store(1);
+        }
         _cond.notify_all();
     }
 

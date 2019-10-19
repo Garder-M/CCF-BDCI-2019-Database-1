@@ -10,7 +10,7 @@ mkdir submit
 cd submit
 
 # Copy source code
-cp -a ../sourcecode ../run.sh ../compile.sh ../README.md ./
+cp -a ../sourcecode ../run.sh ../compile.sh ../README.md ../CMakeLists.txt ./
 
 # Compile and generate binary
 ./compile.sh

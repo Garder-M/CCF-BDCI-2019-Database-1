@@ -55,8 +55,10 @@ if __name__ == '__main__':
     fp.write('    \\\n')
     fp.write('    >"$(basename "$0").stdout"\n')
     fp.write('\n')
-    fp.write('echo\n')
-    fp.write('diff "$(basename "$0").stdout" "$(basename "$0").result"\n')
+    fp.write('if [ -z "$BDCI19_SKIP_DIFF" ]; then\n')
+    fp.write('    echo\n')
+    fp.write('    diff "$(basename "$0").stdout" "$(basename "$0").result"\n')
+    fp.write('fi\n')
     fp.write('\n')
     fp.close()
 

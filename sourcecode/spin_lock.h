@@ -9,7 +9,7 @@ public:
     spin_lock& operator =(const spin_lock&) noexcept = delete;
     spin_lock& operator =(spin_lock&&) noexcept = delete;
 
-    FORCEINLINE explicit spin_lock(const bool locked) noexcept
+    FORCEINLINE explicit spin_lock(const bool locked = false) noexcept
         : _locked((locked ? 1 : 0))
     { }
 

@@ -53,6 +53,12 @@ public:
         }
     }
 
+    [[nodiscard]]
+    FORCEINLINE uint32_t thread_count() const noexcept
+    {
+        return _thread_count;
+    }
+
 private:
     std::atomic_uint64_t _run_once_and_sync_counter { 0 };
     uint32_t _thread_count = 0;

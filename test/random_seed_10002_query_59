@@ -69,6 +69,8 @@ time taskset -c 0-15 ../run.sh \
     \
     >"$(basename "$0").stdout"
 
-echo
-diff "$(basename "$0").stdout" "$(basename "$0").result"
+if [ -z "$BDCI19_SKIP_DIFF" ]; then
+    echo
+    diff "$(basename "$0").stdout" "$(basename "$0").result"
+fi
 
