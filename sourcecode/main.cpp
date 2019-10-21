@@ -110,21 +110,21 @@ int main(int argc, char* argv[])
 
     //
     // Custom initializations
-    // g_loader_thread_count = 1;
+    // loader_thread_count = 1;
     // g_worker_thread_count = 1;
-    // g_loader_sync_barrier.init(g_loader_thread_count);
+    // g_loader_sync_barrier.init(loader_thread_count);
     // g_worker_sync_barrier.init(g_worker_thread_count);
-    if (g_is_creating_index) {
+    if (is_creating_index) {
         create_index_initialize();
     }
     else {
         use_index_initialize();
-        g_loader_sync_barrier.init(g_loader_thread_count);
-        g_loader_threads.reserve(g_loader_thread_count);
-        for (uint32_t tid = 0; tid < g_loader_thread_count; ++tid) {
-            g_loader_threads.emplace_back(fn_loader_thread_use_index, tid);
-        }
-        // for (std::thread& thr : g_loader_threads) thr.join();
+    //     g_loader_sync_barrier.init(g_loader_sync_barrier.thread_count());
+    //     g_loader_threads.reserve(g_loader_sync_barrier.thread_count());
+    //     for (uint32_t tid = 0; tid < g_loader_sync_barrier.thread_count(); ++tid) {
+    //         g_loader_threads.emplace_back(fn_loader_thread_use_index, tid);
+    //     }
+    //     // for (std::thread& thr : g_loader_threads) thr.join();
     }
 
 

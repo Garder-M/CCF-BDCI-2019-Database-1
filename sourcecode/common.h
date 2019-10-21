@@ -67,8 +67,8 @@ inline std::vector<std::thread> g_loader_threads;
 inline sync_barrier g_worker_sync_barrier;
 inline sync_barrier g_loader_sync_barrier;
 
-inline std::vector<std::thread> g_loader_threads;
-inline sync_barrier g_loader_sync_barrier;
+// inline std::vector<std::thread> g_loader_threads;
+// inline sync_barrier g_loader_sync_barrier;
 
 inline uint32_t g_query_count = 0;
 inline const char* const* g_argv_queries = nullptr;
