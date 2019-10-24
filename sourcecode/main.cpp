@@ -119,14 +119,13 @@ int main(int argc, char* argv[])
     }
     else {
         use_index_initialize();
-    //     g_loader_sync_barrier.init(g_loader_sync_barrier.thread_count());
-    //     g_loader_threads.reserve(g_loader_sync_barrier.thread_count());
-    //     for (uint32_t tid = 0; tid < g_loader_sync_barrier.thread_count(); ++tid) {
-    //         g_loader_threads.emplace_back(fn_loader_thread_use_index, tid);
-    //     }
-    //     // for (std::thread& thr : g_loader_threads) thr.join();
-    }
-
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+        g_pretopn_sync_barrier.init(g_worker_sync_barrier.thread_count());
+        g_pretopn_threads.reserve(g_pretopn_sync_barrier.thread_count());
+        for (uint32_t tid = 0; tid < g_pretopn_sync_barrier.thread_count(); ++tid) {
+            g_pretopn_threads.emplace_back(fn_pretopn_thread_use_index, tid);
+        }
+#endif
 
     //
     // Create loader threads and worker threads
@@ -163,6 +162,9 @@ int main(int argc, char* argv[])
     }
 
 
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+        for (std::thread& thr : g_pretopn_threads) thr.join();
+#endif
     //
     // Wait for worker and loader threads
     //

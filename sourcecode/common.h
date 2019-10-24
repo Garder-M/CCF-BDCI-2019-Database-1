@@ -66,9 +66,10 @@ inline std::vector<std::thread> g_worker_threads;
 inline std::vector<std::thread> g_loader_threads;
 inline sync_barrier g_worker_sync_barrier;
 inline sync_barrier g_loader_sync_barrier;
-
-// inline std::vector<std::thread> g_loader_threads;
-// inline sync_barrier g_loader_sync_barrier;
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+inline std::vector<std::thread> g_pretopn_threads;
+inline sync_barrier g_pretopn_sync_barrier;
+#endif
 
 inline uint32_t g_query_count = 0;
 inline const char* const* g_argv_queries = nullptr;
@@ -87,6 +88,9 @@ inline const char* const* g_argv_queries = nullptr;
 void fn_loader_thread_create_index(const uint32_t tid) noexcept;
 void fn_worker_thread_create_index(const uint32_t tid) noexcept;
 void create_index_initialize() noexcept;
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+void fn_pretopn_thread_use_index(const uint32_t tid) noexcept;
+#endif
 
 
 //==============================================================================
