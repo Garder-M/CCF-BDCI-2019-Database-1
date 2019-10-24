@@ -6,9 +6,9 @@
 #endif
 
 #if !defined(MAKE_FASTEST)
-#define ENABLE_ASSERTION                    0
-#define ENABLE_LOGGING_DEBUG                0
-#define ENABLE_LOGGING_INFO                 0
+#define ENABLE_ASSERTION                    1
+#define ENABLE_LOGGING_DEBUG                1
+#define ENABLE_LOGGING_INFO                 1
 #endif
 
 // Do we pin worker and loader threads to its corresponding CPU core?

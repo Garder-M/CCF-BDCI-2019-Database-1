@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <climits>
 #include <vector>
+#include <string>
 #include <algorithm>
 #include <functional>
 #include <sys/sysctl.h>

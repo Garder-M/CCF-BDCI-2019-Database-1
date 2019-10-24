@@ -126,6 +126,7 @@ int main(int argc, char* argv[])
             g_pretopn_threads.emplace_back(fn_pretopn_thread_use_index, tid);
         }
 #endif
+    }
 
     //
     // Create loader threads and worker threads

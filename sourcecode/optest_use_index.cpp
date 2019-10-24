@@ -50,11 +50,10 @@ struct date_item_range_t
     date_t orderdate;
     uint32_t item_count;
     uint32_t* item_begin;
-}
+};
 
 #define MAX_SHIP_ORDER_DATE_OFFSET 128
 #define MAX_PARTIAL_COUNT 20
-constexpr const uint32_t max_date_item_count = MAX_SHIP_ORDER_DATE_OFFSET * MAX_PARTIAL_COUNT;
 namespace
 {
     int g_mktsegment_fd = -1;
@@ -66,7 +65,8 @@ namespace
     done_event* g_queries_done = nullptr;
     // std::atomic_uint32_t g_queries_curr { 0 };
 
-    partial_index_t* g_partial_indices = nullptr;
+    // partial_index_t* g_partial_indices = nullptr;
+    constexpr const uint32_t max_date_item_count = MAX_SHIP_ORDER_DATE_OFFSET * MAX_PARTIAL_COUNT;
     // done_event g_partial_index_loaded { };
     typedef spsc_queue<date_item_range_t, max_date_item_count> date_item_range_queue;
     std::vector<date_item_range_queue> g_di_range_queues_of_query { };
@@ -124,7 +124,7 @@ void use_index_initialize() noexcept
 
             INFO("g_meta.partial_index_count: %u", g_meta.partial_index_count);
             INFO("g_meta.max_shipdate_orderdate_diff: %u", g_meta.max_shipdate_orderdate_diff);
-            g_partial_indices = new partial_index_t[g_meta.partial_index_count];
+            // g_partial_indices = new partial_index_t[g_meta.partial_index_count];
         }
 
         openat_file_read("mktsegment", &g_mktsegment_fd, &g_mktsegment_file_size);
@@ -178,10 +178,10 @@ void use_index_initialize() noexcept
     {
         g_queries_done = new done_event[g_query_count];
         g_queries.resize(g_query_count);
-        g_di_range_queues_of_query = new uintptr_t[g_query_count];
+        // g_di_range_queues_of_query = new uintptr_t[g_query_count];
 
         std::vector<std::vector<uint32_t> > pretopn_queries_by_mktid;
-        std::vector<std::vector<date_t> pretopn_dates_by_mktid;
+        std::vector<std::vector<date_t> > pretopn_dates_by_mktid;
         std::vector<std::vector<date_range_t> > pretopn_d_ranges_by_mktid;
 
         pretopn_queries_by_mktid.resize(g_mktid_count);
@@ -348,7 +348,7 @@ void use_index_initialize() noexcept
     // Load queries
     {
         g_queries_done = new done_event[g_query_count];
-        g_di_range_queues_of_query = new uintptr_t[g_query_count];
+        // g_di_range_queues_of_query = new uintptr_t[g_query_count];
         g_queries.resize(g_query_count);
         for (uint32_t q = 0; q < g_query_count; ++q) {
             query_t& query = g_queries[q];
@@ -483,12 +483,12 @@ void fn_pretopn_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         ASSERT(query.d_shared_pretopn_end <= query.d_pretopn_end);
         for (date_t orderdate = query.d_pretopn_begin; orderdate < query.d_shared_pretopn_begin; 
                 orderdate += CONFIG_TOPN_DATES_PER_PLATE) {
-            const uint32_t plate_id = calc_topn_plate_index(mktid, orderdate);
+            const uint32_t plate_id = calc_topn_plate_index(query.q_mktid, orderdate);
             scan_plate(plate_id, orderdate, query);
         }
         for (date_t orderdate = query.d_shared_pretopn_end; orderdate < query.d_pretopn_end; 
                 orderdate += CONFIG_TOPN_DATES_PER_PLATE) {
-            const uint32_t plate_id = calc_topn_plate_index(mktid, orderdate);
+            const uint32_t plate_id = calc_topn_plate_index(query.q_mktid, orderdate);
             scan_plate(plate_id, orderdate, query);
         }
         g_pretopn_queries_done[qid].mark_done();
@@ -510,15 +510,15 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         __endoffsets_fd = new int[g_meta.partial_index_count];
         __items_file_size = new uint64_t[g_meta.partial_index_count];
         __endoffsets_file_size = new uint64_t[g_meta.partial_index_count];
-        __endoffsets_ptr = new (uint64_t*)[g_meta.partial_index_count];
+        __endoffsets_ptr = new uint64_t*[g_meta.partial_index_count];
         for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
             snprintf(filename, std::size(filename), "items_%u", i);
             openat_file_read(filename, &__items_fd[i], &__items_file_size[i]);
 
             snprintf(filename, std::size(filename), "endoffset_%u", i);
-            openat_file_read(filename, &__endoffsets_fd[i], &endoffsets_file_size[i]);
+            openat_file_read(filename, &__endoffsets_fd[i], &__endoffsets_file_size[i]);
             __endoffsets_ptr[i] = (uint64_t*)my_mmap(
-                endoffsets_file_size[i],
+                __endoffsets_file_size[i],
                 PROT_READ,
                 MAP_PRIVATE | MAP_POPULATE,
                 __endoffsets_fd[i],
@@ -541,7 +541,7 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                 const uint64_t scan_begin_offset = bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
                 for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
                     di_range.item_count = __endoffsets_ptr[i][bucket];
-                    di_range.item_begin = my_mmap(
+                    di_range.item_begin = (uint32_t*)my_mmap(
                         di_range.item_count * sizeof(uint32_t),
                         PROT_READ,
                         MAP_PRIVATE | MAP_POPULATE,
@@ -568,11 +568,11 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
     g_loader_sync_barrier.sync_and_run_once([]() {
         // TODO: cleanup
 
-        for (uint32_t query_id = 0; query_id < g_query_count; ++query_id) {
-            g_queries_done[query_id].wait_done();
+        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
+            g_queries_done[qid].wait_done();
 
             // print query
-            const query_t& query = g_queries[query_id];
+            const query_t& query = g_queries[qid];
             const size_t cnt = fwrite(query.output.data(), sizeof(char), query.output.length(), stdout);
             CHECK(cnt == query.output.length());
         }
@@ -591,10 +591,11 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
 #if CONFIG_TOPN_DATES_PER_PLATE > 0
         g_pretopn_queries_done[qid].wait_done();
 #endif
-        const query_t& query = g_queries[qid];
+        query_t& query = g_queries[qid];
         date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
         date_item_range_t di_range;
         uint32_t total_expend_cent = 0;
+        const date_t orderdate = di_range.orderdate;
         const auto maybe_update_topn = [&](const uint32_t orderkey) {
             if (total_expend_cent == 0) {
                 return;
@@ -619,9 +620,9 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
             }
         };
         while (di_range_queue.pop(&di_range)) {
-            const uint32_t* p_scan_begin = di_range.item_begin;
-            const uint32_t* p_scan_end = p_scan_begin + di_range.item_count;
-            for (uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {
+            const uint32_t* const p_scan_begin = di_range.item_begin;
+            const uint32_t* const p_scan_end = p_scan_begin + di_range.item_count;
+            for (const uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {
                 const uint32_t value = *p;
                 if (value & 0x80000000) {  // This is orderkey
                     const uint32_t orderkey = value & ~0x80000000;
@@ -682,7 +683,7 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
             query.output += '\n';
         }
 
-        DEBUG("[%u] query #%u done", tid, query_id);
-        g_queries_done[query_id].mark_done();
+        DEBUG("[%u] query #%u done", tid, qid);
+        g_queries_done[qid].mark_done();
     }
 }
