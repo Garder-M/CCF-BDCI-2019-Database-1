@@ -53,7 +53,7 @@ struct date_item_range_t
 };
 
 #define MAX_SHIP_ORDER_DATE_OFFSET 128
-#define MAX_PARTIAL_COUNT 20
+#define MAX_PARTIAL_COUNT 30
 namespace
 {
     int g_mktsegment_fd = -1;
@@ -534,13 +534,15 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         const query_t& query = g_queries[qid];
         date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
         const auto mmap_date_item_range = [&](const date_t d_begin, const date_t d_end) {
+            DEBUG("loader%u mmap di_range[%u,%u), qid=%u", tid, d_begin, d_end, qid);
             date_item_range_t di_range;
             for (date_t orderdate = d_begin; orderdate < d_end; ++orderdate) {
+                DEBUG("loader%u mmap orderdate%u, qid=%u", tid, orderdate, qid);
                 di_range.orderdate = orderdate;
                 const uint32_t bucket = calc_bucket_index(query.q_mktid, orderdate);
                 const uint64_t scan_begin_offset = bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
                 for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
-                    di_range.item_count = __endoffsets_ptr[i][bucket];
+                    di_range.item_count = __endoffsets_ptr[i][bucket] / sizeof(uint32_t);
                     di_range.item_begin = (uint32_t*)my_mmap(
                         di_range.item_count * sizeof(uint32_t),
                         PROT_READ,
@@ -548,6 +550,9 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                         __items_fd[i],
                         scan_begin_offset
                     );
+                    
+                    // DEBUG("loader%u push di_range[item_begin=%p,item_count=%u], qid=%u", 
+                    //     tid, di_range.item_begin, di_range.item_count, qid);
                     di_range_queue.push(di_range);
                 }
             }
@@ -620,6 +625,7 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
             }
         };
         while (di_range_queue.pop(&di_range)) {
+            // DEBUG("worker%u fetch di_range[item_begin=%p,item_count=%u], qid=%u", tid, di_range.item_begin, di_range.item_count, qid);
             const uint32_t* const p_scan_begin = di_range.item_begin;
             const uint32_t* const p_scan_end = p_scan_begin + di_range.item_count;
             for (const uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {

@@ -920,13 +920,18 @@ void worker_calc_pretopn_multi_part([[maybe_unused]] const uint32_t tid) noexcep
         std::sort(desc.topn_values, desc.topn_values + desc.topn_count, std::greater<>());
 
 #if ENABLE_LOGGING_DEBUG
-        const uint64_t value = desc.topn_values[0];
-        const uint32_t expend_cent = value >> 36;
-        const uint32_t orderkey = (value >> 6) & ((1U << 30) - 1);
-        const date_t orderdate = from_orderdate + (value & 0b111111U);
-        const auto tuple = date_get_ymd(orderdate);
-        DEBUG("plate %u: N=%u, top=(orderkey=%u,orderdate=%u-%02u-%02u,expend_cent=%u)",
-             plate_id, desc.topn_count, orderkey, std::get<0>(tuple), std::get<1>(tuple), std::get<2>(tuple), expend_cent);
+        if (desc.topn_count > 0) {
+            const uint64_t value = desc.topn_values[0];
+            const uint32_t expend_cent = value >> 36;
+            const uint32_t orderkey = (value >> 6) & ((1U << 30) - 1);
+            const date_t orderdate = from_orderdate + (value & 0b111111U);
+            const auto tuple = date_get_ymd(orderdate);
+            DEBUG("plate %u: N=%u, top=(orderkey=%u,orderdate=%u-%02u-%02u,expend_cent=%u)",
+                plate_id, desc.topn_count, orderkey, std::get<0>(tuple), std::get<1>(tuple), std::get<2>(tuple), expend_cent);
+        }
+        else {
+            DEBUG("plate %u: N=0", plate_id);
+        }
 #endif
 
         pwrite_queue.push(desc_index);

@@ -128,7 +128,7 @@ FORCEINLINE void openat_file_read(
     /*out*/ uint64_t *const file_size) noexcept
 {
     ASSERT(g_index_directory_fd >= 0);
-    ASSERT(*fd == -1, "fd should be initialized to -1 to prevent bugs");
+    //ASSERT(*fd == -1, "fd should be initialized to -1 to prevent bugs");
     *fd = C_CALL(openat(g_index_directory_fd, path, O_RDONLY | O_CLOEXEC));
 
     struct stat64 st;
