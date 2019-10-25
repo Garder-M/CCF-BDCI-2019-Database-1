@@ -32,6 +32,7 @@ struct query_t
 
     bool is_unknown_mktsegment;
     std::vector<query_result_t> result;
+    std::vector<std::pair<uint32_t*, uint32_t> > date_item_meta;
     std::string output;
 };
 
@@ -48,8 +49,8 @@ struct date_range_t
 struct date_item_range_t
 {
     date_t orderdate;
-    uint32_t item_count;
-    uint32_t* item_begin;
+    uint32_t pair_begin;
+    uint32_t pair_end;
 };
 
 #define MAX_SHIP_ORDER_DATE_OFFSET 128
@@ -82,10 +83,8 @@ namespace
     done_event* g_pretopn_queries_done = nullptr;
 
     std::vector<uint32_t> g_pretopn_queries { };
-    std::atomic_uint32_t g_pretopn_queries_curr { 0 };
 
     std::vector<date_range_t> g_shared_pretopn_d_ranges { };
-    std::atomic_uint32_t g_shared_pretopn_d_ranges_curr { 0 };
 #endif
 }
 
@@ -104,7 +103,7 @@ FORCEINLINE uint32_t calc_topn_plate_index(const uint8_t mktid, const date_t ord
 {
     ASSERT(orderdate >= MIN_TABLE_DATE);
     ASSERT(orderdate <= MAX_TABLE_DATE);
-    ASSERT((orderdate - MAX_TABLE_DATE) % CONFIG_TOPN_DATES_PER_PLATE == 0);
+    ASSERT((orderdate - MIN_TABLE_DATE) % CONFIG_TOPN_DATES_PER_PLATE == 0);
 
     return (uint32_t)(mktid - 0) * PLATES_PER_MKTID + (uint32_t)(orderdate - MIN_TABLE_DATE) / CONFIG_TOPN_DATES_PER_PLATE;
 }
@@ -235,7 +234,8 @@ void use_index_initialize() noexcept
                 ASSERT(d_pretopn_begin > q_shipdate);
                 ASSERT(d_pretopn_end <= q_orderdate);
                 if (d_pretopn_begin >= q_orderdate || d_pretopn_end <= q_shipdate || 
-                    d_pretopn_begin == d_pretopn_end || query.q_topn > CONFIG_EXPECT_MAX_TOPN) {
+                    d_pretopn_begin == d_pretopn_end || query.q_topn > CONFIG_EXPECT_MAX_TOPN ||
+                    query.q_topn <= 0) {
                     d_pretopn_begin = q_orderdate;
                     d_pretopn_end = q_orderdate;
                     pretopn_shared_flag[q] = true; // mark as already shared to avoid checking
@@ -253,11 +253,18 @@ void use_index_initialize() noexcept
                 query.d_pretopn_end = d_pretopn_end;
             }
             else {
+                query.d_pretopn_begin = q_orderdate;
+                query.d_pretopn_end = q_orderdate;
                 pretopn_shared_flag[q] = true; // mark as already shared to avoid checking
                 // mark skip pretopn
                 g_pretopn_queries_done[q].mark_done();
             }
+            DEBUG("qid%u scan[%u,%u) pretopn[%u,%u)", 
+                q,
+                query.d_scan_begin,query.d_scan_end, 
+                query.d_pretopn_begin,query.d_pretopn_end);
         }
+        DEBUG("pretopn query(s) size %u", g_pretopn_queries.size());
 
         uint32_t* q_index_buffer = nullptr;
         q_index_buffer = new uint32_t[g_query_count * max_date_ranges_count];
@@ -338,7 +345,6 @@ void use_index_initialize() noexcept
                 shared_buffer_l = shared_buffer_r;
             }
         }
-        // TODO: create threads to implement the topN plan
 
         if (q_index_buffer != nullptr) delete [] q_index_buffer;
         if (pretopn_shared_flag != nullptr) delete [] pretopn_shared_flag;
@@ -386,7 +392,8 @@ void fn_pretopn_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         ASSERT(plate_id < g_mktid_count * PLATES_PER_MKTID);
         const uint64_t* const plate_ptr = &g_pretopn_ptr[plate_id * CONFIG_EXPECT_MAX_TOPN];
         const uint32_t count = g_pretopn_count_ptr[plate_id];
-        //DEBUG("plate_id: %u, count: %u", plate_id, count);
+        // DEBUG("pretopn%u scan_plate plate_id=%u,from_orderdate=%u,count=%u", 
+            // tid, plate_id, from_orderdate, count);
 
         for (uint32_t i = 0; i < count; ++i) {
             const uint64_t value = plate_ptr[i];
@@ -416,22 +423,27 @@ void fn_pretopn_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         }
     };
 
+    static std::atomic_uint32_t __shared_pretopn_d_ranges_curr { 0 };
     while (true) {
-        const uint32_t task_id = g_shared_pretopn_d_ranges_curr++;
+        const uint32_t task_id = __shared_pretopn_d_ranges_curr++;
         if (task_id >= g_shared_pretopn_d_ranges.size()) break;
         const date_range_t& d_range = g_shared_pretopn_d_ranges[task_id];
         uint32_t max_q_topn = 0;
         uint32_t max_q_topn_qid = 0;
         ASSERT(d_range.d_begin < d_range.d_end);
         ASSERT(d_range.q_index_begin < d_range.q_index_end);
+        DEBUG("pretopn%u fetch shared_q_range[%u,%u) shared by %u query(s), offset[%u,%u)", 
+            tid, d_range.d_begin, d_range.d_end, d_range.q_index_end-d_range.q_index_begin,
+            d_range.q_index_begin, d_range.q_index_end);
         for (uint32_t l = d_range.q_index_begin; l < d_range.q_index_end; ++l) {
             const uint32_t qid = g_shared_pretopn_q_index_buffer[l];
             const query_t& query = g_queries[qid];
             ASSERT(d_range.d_begin == query.d_shared_pretopn_begin);
             ASSERT(d_range.d_end == query.d_shared_pretopn_end);
-            max_q_topn = (query.q_topn > max_q_topn) ? query.q_topn : max_q_topn;
-            max_q_topn_qid = (query.q_topn > max_q_topn) ? qid 
-                                                         : max_q_topn_qid;
+            if (query.q_topn > max_q_topn) {
+                max_q_topn = query.q_topn;
+                max_q_topn_qid = qid;
+            }
         }
         query_t& ref_query = g_queries[max_q_topn_qid];
         const uint8_t mktid = ref_query.q_mktid;
@@ -469,14 +481,19 @@ void fn_pretopn_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         if (heap_reordered && ref_result.size() >= ref_query.q_topn) {
             std::make_heap(ref_result.begin(), ref_result.end(), std::greater<>());
         }
+        DEBUG("pretopn%u finished shared_q_range[%u,%u) shared by %u query(s), ref_qid=%u", 
+            tid, d_range.d_begin, d_range.d_end, d_range.q_index_end-d_range.q_index_begin, max_q_topn_qid);
         g_shared_pretopn_queries_done[max_q_topn_qid].mark_done();
     }
 
+    static std::atomic_uint32_t __pretopn_queries_curr { 0 };
     while (true) {
-        const uint32_t task_id = g_pretopn_queries_curr++;
+        const uint32_t task_id = __pretopn_queries_curr++;
         if (task_id >= g_pretopn_queries.size()) break;
         const uint32_t qid = g_pretopn_queries[task_id];
         g_shared_pretopn_queries_done[qid].wait_done();
+        DEBUG("pretopn%u starts query%u pretopn", 
+            tid, qid);
         query_t& query = g_queries[qid];
         ASSERT(query.d_pretopn_begin <= query.d_shared_pretopn_begin);
         ASSERT(query.d_shared_pretopn_begin < query.d_shared_pretopn_end);
@@ -523,6 +540,7 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                 MAP_PRIVATE | MAP_POPULATE,
                 __endoffsets_fd[i],
                 0);
+            DEBUG("__endoffsets_ptr[%u]=%p", i, __endoffsets_ptr[i]);
         }
     });
 
@@ -531,8 +549,11 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         const uint32_t task_id = __g_queries_curr++;
         if (task_id >= g_query_count) break;
         const uint32_t qid = task_id;
-        const query_t& query = g_queries[qid];
+        query_t& query = g_queries[qid];
+        if (query.q_topn <= 0) continue;
         date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
+        uint32_t item_range_meta_l = 0;
+        uint32_t item_range_meta_r = 0;
         const auto mmap_date_item_range = [&](const date_t d_begin, const date_t d_end) {
             DEBUG("loader%u mmap di_range[%u,%u), qid=%u", tid, d_begin, d_end, qid);
             date_item_range_t di_range;
@@ -540,31 +561,48 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                 DEBUG("loader%u mmap orderdate%u, qid=%u", tid, orderdate, qid);
                 di_range.orderdate = orderdate;
                 const uint32_t bucket = calc_bucket_index(query.q_mktid, orderdate);
-                const uint64_t scan_begin_offset = bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
-                for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
-                    di_range.item_count = __endoffsets_ptr[i][bucket] / sizeof(uint32_t);
-                    di_range.item_begin = (uint32_t*)my_mmap(
-                        di_range.item_count * sizeof(uint32_t),
-                        PROT_READ,
-                        MAP_PRIVATE | MAP_POPULATE,
-                        __items_fd[i],
-                        scan_begin_offset
-                    );
-                    
-                    // DEBUG("loader%u push di_range[item_begin=%p,item_count=%u], qid=%u", 
-                    //     tid, di_range.item_begin, di_range.item_count, qid);
-                    di_range_queue.push(di_range);
+                const uint64_t scan_begin_offset = (uint64_t)bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
+                for (uint32_t i = 0; i < g_meta.partial_index_count; ++i, ++item_range_meta_r) {
+                    std::pair<uint32_t*, uint32_t>& pair = query.date_item_meta[item_range_meta_r];
+                    pair.second = __endoffsets_ptr[i][bucket] - scan_begin_offset;
+                    // DEBUG("pair.second=%lu(0x%016lx),(pair.second==0)=%u,sizeof(uint32_t)=%lu,pair.second/sizeof(uint32_t)=%lu",
+                    //     pair.second, pair.second, pair.second==0, sizeof(uint32_t), pair.second/sizeof(uint32_t));
+                    if (pair.second == 0) {
+                        pair.first = nullptr;
+                    }
+                    else {
+                        pair.first = (uint32_t*)my_mmap(
+                            pair.second,
+                            PROT_READ,
+                            MAP_PRIVATE | MAP_POPULATE,
+                            __items_fd[i],
+                            scan_begin_offset
+                        );
+                        pair.second /= sizeof(uint32_t);
+                    }
+                    // DEBUG("loader%u mmap pair(%p,%u) size %uKB, qid%u mktid%u", 
+                    //     tid, pair.first, pair.second, pair.second * sizeof(uint32_t) / 1024,
+                    //     qid, query.q_mktid);
                 }
+                di_range.pair_begin = item_range_meta_l;
+                di_range.pair_end = item_range_meta_r;
+                di_range_queue.push(di_range);
+                item_range_meta_l = item_range_meta_r;
             }
         };
 #if CONFIG_TOPN_DATES_PER_PLATE > 0
         ASSERT(query.d_scan_begin <= query.d_pretopn_begin);
         ASSERT(query.d_pretopn_begin <= query.d_pretopn_end);
         ASSERT(query.d_pretopn_end <= query.d_scan_end);
+        const date_t d_scan_total = query.d_scan_end - query.d_pretopn_end 
+                                    + query.d_pretopn_begin - query.d_scan_begin;
+        query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
         mmap_date_item_range(query.d_scan_begin, query.d_pretopn_begin);
         mmap_date_item_range(query.d_pretopn_end, query.d_scan_end);
 #else
         ASSERT(query.d_scan_begin <= query.d_scan_end);
+        const date_t d_scan_total = query.d_scan_end - query.d_scan_begin;
+        query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
         mmap_date_item_range(query.d_scan_begin, query.d_scan_end);
 #endif
         di_range_queue.mark_push_finish();
@@ -580,6 +618,7 @@ void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
             const query_t& query = g_queries[qid];
             const size_t cnt = fwrite(query.output.data(), sizeof(char), query.output.length(), stdout);
             CHECK(cnt == query.output.length());
+            DEBUG("query%u result length%u, done", qid, query.output.length());
         }
         C_CALL(fflush(stdout));
     });
@@ -597,10 +636,11 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         g_pretopn_queries_done[qid].wait_done();
 #endif
         query_t& query = g_queries[qid];
+        if (query.q_topn <= 0) continue;
         date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
         date_item_range_t di_range;
         uint32_t total_expend_cent = 0;
-        const date_t orderdate = di_range.orderdate;
+        date_t orderdate;
         const auto maybe_update_topn = [&](const uint32_t orderkey) {
             if (total_expend_cent == 0) {
                 return;
@@ -625,26 +665,34 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
             }
         };
         while (di_range_queue.pop(&di_range)) {
-            // DEBUG("worker%u fetch di_range[item_begin=%p,item_count=%u], qid=%u", tid, di_range.item_begin, di_range.item_count, qid);
-            const uint32_t* const p_scan_begin = di_range.item_begin;
-            const uint32_t* const p_scan_end = p_scan_begin + di_range.item_count;
-            for (const uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {
-                const uint32_t value = *p;
-                if (value & 0x80000000) {  // This is orderkey
-                    const uint32_t orderkey = value & ~0x80000000;
-                    maybe_update_topn(orderkey);
-                    total_expend_cent = 0;
-                }
-                else {
-                    const date_t shipdate = orderdate + (value >> 24);
-                    if (shipdate > query.q_shipdate) {
-                        const uint32_t expend_cent = value & 0x00FFFFFF;
-                        ASSERT(expend_cent > 0);
-                        total_expend_cent += expend_cent;
+            DEBUG("worker%u fetch di_range[orderdate=%u,[%u,%u)], qid=%u", tid, 
+                di_range.orderdate, di_range.pair_begin, di_range.pair_end, qid);
+            orderdate = di_range.orderdate;
+            for (uint32_t off = di_range.pair_begin; off < di_range.pair_end; ++off) {
+                const uint32_t* const p_scan_begin = query.date_item_meta[off].first;
+                const uint32_t item_count = query.date_item_meta[off].second;
+                const uint32_t* const p_scan_end = p_scan_begin + item_count;
+                for (const uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {
+                    const uint32_t value = *p;
+                    if (value & 0x80000000) {  // This is orderkey
+                        const uint32_t orderkey = value & ~0x80000000;
+                        maybe_update_topn(orderkey);
+                        total_expend_cent = 0;
+                    }
+                    else {
+                        const date_t shipdate = orderdate + (value >> 24);
+                        if (shipdate > query.q_shipdate) {
+                            const uint32_t expend_cent = value & 0x00FFFFFF;
+                            ASSERT(expend_cent > 0, "worker%u query%u orderdate%u off%u pair[%p,%u) p%p",
+                                tid, qid, orderdate, off, p_scan_begin, item_count, p);
+                            total_expend_cent += expend_cent;
+                        }
                     }
                 }
+                if (p_scan_begin != nullptr) {
+                    C_CALL(munmap((void*)p_scan_begin, (size_t)(item_count * sizeof(uint32_t))));
+                }
             }
-            C_CALL(munmap((void*)di_range.item_begin, (size_t)(di_range.item_count * sizeof(uint32_t))));
         }
 
         //
