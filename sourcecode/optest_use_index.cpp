@@ -32,8 +32,10 @@ struct query_t
 
     bool is_unknown_mktsegment;
     std::vector<query_result_t> result;
-    std::vector<std::pair<uint32_t*, uint32_t> > date_item_meta;
+    // std::vector<std::pair<uint32_t*, uint32_t> > date_item_meta;
     std::string output;
+    uint32_t* item_buffer = nullptr;
+    uint32_t* item_size_buffer = nullptr;
 };
 
 #if CONFIG_TOPN_DATES_PER_PLATE > 0
@@ -48,9 +50,12 @@ struct date_range_t
 
 struct date_item_range_t
 {
+    // date_t orderdate;
+    // uint32_t pair_begin;
+    // uint32_t pair_end;
     date_t orderdate;
-    uint32_t pair_begin;
-    uint32_t pair_end;
+    // uint32_t* item_buffer_begin;
+    date_t d_offset;
 };
 
 #define MAX_SHIP_ORDER_DATE_OFFSET 128
@@ -535,129 +540,6 @@ void fn_pretopn_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
 }
 #endif
 
-void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
-{
-    static int* __items_fd = nullptr;
-    static int* __endoffsets_fd = nullptr;
-    static uint64_t* __items_file_size = nullptr;
-    static uint64_t* __endoffsets_file_size = nullptr;
-    static uint64_t** __endoffsets_ptr = nullptr;
-    g_loader_sync_barrier.run_once_and_sync([]() {
-        g_di_range_queues_of_query.resize(g_query_count);
-        char filename[32];
-        __items_fd = new int[g_meta.partial_index_count];
-        __endoffsets_fd = new int[g_meta.partial_index_count];
-        __items_file_size = new uint64_t[g_meta.partial_index_count];
-        __endoffsets_file_size = new uint64_t[g_meta.partial_index_count];
-        __endoffsets_ptr = new uint64_t*[g_meta.partial_index_count];
-        for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
-            snprintf(filename, std::size(filename), "items_%u", i);
-            openat_file_read(filename, &__items_fd[i], &__items_file_size[i]);
-
-            snprintf(filename, std::size(filename), "endoffset_%u", i);
-            openat_file_read(filename, &__endoffsets_fd[i], &__endoffsets_file_size[i]);
-            __endoffsets_ptr[i] = (uint64_t*)my_mmap(
-                __endoffsets_file_size[i],
-                PROT_READ,
-                MAP_PRIVATE | MAP_POPULATE,
-                __endoffsets_fd[i],
-                0);
-            DEBUG("__endoffsets_ptr[%u]=%p", i, __endoffsets_ptr[i]);
-        }
-    });
-
-    static std::atomic_uint32_t __g_queries_curr { 0 };
-    while (true) {
-        const uint32_t task_id = __g_queries_curr++;
-        if (task_id >= g_query_count) break;
-        const uint32_t qid = g_tasks_to_query[task_id];
-        query_t& query = g_queries[qid];
-#if CONFIG_TOPN_DATES_PER_PLATE > 0
-        const date_t d_scan_total = query.d_scan_end - query.d_pretopn_end 
-                                    + query.d_pretopn_begin - query.d_scan_begin;
-#else
-        const date_t d_scan_total = query.d_scan_end - query.d_scan_begin;
-#endif
-        date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
-        if (d_scan_total <= 0 || query.q_topn <= 0) {
-            di_range_queue.mark_push_finish();
-            continue;
-        }
-        uint32_t item_range_meta_l = 0;
-        uint32_t item_range_meta_r = 0;
-        const auto mmap_date_item_range = [&](const date_t d_begin, const date_t d_end) {
-            DEBUG("loader%u mmap di_range[%u,%u), query%u task_id%u", tid, d_begin, d_end, qid, task_id);
-            date_item_range_t di_range;
-            for (date_t orderdate = d_begin; orderdate < d_end; ++orderdate) {
-                // DEBUG("loader%u mmap orderdate%u, qid=%u", tid, orderdate, qid);
-                di_range.orderdate = orderdate;
-                const uint32_t bucket = calc_bucket_index(query.q_mktid, orderdate);
-                const uint64_t scan_begin_offset = (uint64_t)bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
-                for (uint32_t i = 0; i < g_meta.partial_index_count; ++i, ++item_range_meta_r) {
-                    std::pair<uint32_t*, uint32_t>& pair = query.date_item_meta[item_range_meta_r];
-                    pair.second = __endoffsets_ptr[i][bucket] - scan_begin_offset;
-                    // DEBUG("pair.second=%lu(0x%016lx),(pair.second==0)=%u,sizeof(uint32_t)=%lu,pair.second/sizeof(uint32_t)=%lu",
-                    //     pair.second, pair.second, pair.second==0, sizeof(uint32_t), pair.second/sizeof(uint32_t));
-                    if (pair.second == 0) {
-                        // pair.first = nullptr;
-                        --item_range_meta_r;
-                    }
-                    else {
-                        pair.first = (uint32_t*)my_mmap(
-                            pair.second,
-                            PROT_READ,
-                            MAP_PRIVATE | MAP_POPULATE,
-                            __items_fd[i],
-                            scan_begin_offset
-                        );
-                        pair.second /= sizeof(uint32_t);
-                        DEBUG("loader%u mmap pair(%p,%u) size %uKB, qid%u mktid%u", 
-                            tid, pair.first, pair.second, pair.second * sizeof(uint32_t) / 1024,
-                            qid, query.q_mktid);
-                    }
-                }
-                if (item_range_meta_r > item_range_meta_l) {
-                    di_range.pair_begin = item_range_meta_l;
-                    di_range.pair_end = item_range_meta_r;
-                    di_range_queue.push(di_range);
-                    item_range_meta_l = item_range_meta_r;
-                }
-                else {
-                    item_range_meta_r = item_range_meta_l;
-                }
-            }
-        };
-#if CONFIG_TOPN_DATES_PER_PLATE > 0
-        ASSERT(query.d_scan_begin <= query.d_pretopn_begin);
-        ASSERT(query.d_pretopn_begin <= query.d_pretopn_end);
-        ASSERT(query.d_pretopn_end <= query.d_scan_end);
-        query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
-        mmap_date_item_range(query.d_scan_begin, query.d_pretopn_begin);
-        mmap_date_item_range(query.d_pretopn_end, query.d_scan_end);
-#else
-        ASSERT(query.d_scan_begin <= query.d_scan_end);
-        query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
-        mmap_date_item_range(query.d_scan_begin, query.d_scan_end);
-#endif
-        di_range_queue.mark_push_finish();
-    }
-
-    g_loader_sync_barrier.sync_and_run_once([]() {
-        // TODO: cleanup
-
-        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
-            g_queries_done[qid].wait_done();
-
-            // print query
-            const query_t& query = g_queries[qid];
-            const size_t cnt = fwrite(query.output.data(), sizeof(char), query.output.length(), stdout);
-            CHECK(cnt == query.output.length());
-            DEBUG("query%u result length%u, done", qid, query.output.length());
-        }
-        C_CALL(fflush(stdout));
-    });
-
-}
 
 void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
 {
@@ -706,13 +588,15 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                 }
             }
         };
+        const uint32_t max_buf_item_size = g_meta.max_bucket_actual_size_up_aligned / sizeof(uint32_t);
         while (di_range_queue.pop(&di_range)) {
             // DEBUG("worker%u fetch di_range[orderdate=%u,[%u,%u)], qid=%u", tid, 
             //     di_range.orderdate, di_range.pair_begin, di_range.pair_end, qid);
             orderdate = di_range.orderdate;
-            for (uint32_t off = di_range.pair_begin; off < di_range.pair_end; ++off) {
-                const uint32_t* const p_scan_begin = query.date_item_meta[off].first;
-                const uint32_t item_count = query.date_item_meta[off].second;
+            for (uint32_t off = 0; off < g_meta.partial_index_count; ++off) {
+                const uint32_t data_off = g_meta.partial_index_count * di_range.d_offset + off;
+                const uint32_t* const p_scan_begin = query.item_buffer + data_off * max_buf_item_size;
+                const uint32_t item_count = query.item_size_buffer[data_off];
                 const uint32_t* const p_scan_end = p_scan_begin + item_count;
                 for (const uint32_t* p = p_scan_begin; p < p_scan_end; ++p) {
                     const uint32_t value = *p;
@@ -730,9 +614,6 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
                             total_expend_cent += expend_cent;
                         }
                     }
-                }
-                if (p_scan_begin != nullptr) {
-                    C_CALL(munmap((void*)p_scan_begin, (size_t)(item_count * sizeof(uint32_t))));
                 }
             }
         }
@@ -782,4 +663,111 @@ void fn_worker_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
         DEBUG("[%u] query #%u done task_id%u", tid, qid, task_id);
         g_queries_done[qid].mark_done();
     }
+}
+
+void fn_loader_thread_use_index([[maybe_unused]] const uint32_t tid) noexcept
+{
+    static int* __items_fd = nullptr;
+    static int* __endoffsets_fd = nullptr;
+    static uint64_t* __items_file_size = nullptr;
+    static uint64_t* __endoffsets_file_size = nullptr;
+    static uint64_t** __endoffsets_ptr = nullptr;
+    g_loader_sync_barrier.run_once_and_sync([]() {
+        g_di_range_queues_of_query.resize(g_query_count);
+        char filename[32];
+        __items_fd = new int[g_meta.partial_index_count];
+        __endoffsets_fd = new int[g_meta.partial_index_count];
+        __items_file_size = new uint64_t[g_meta.partial_index_count];
+        __endoffsets_file_size = new uint64_t[g_meta.partial_index_count];
+        __endoffsets_ptr = new uint64_t*[g_meta.partial_index_count];
+        for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
+            snprintf(filename, std::size(filename), "items_%u", i);
+            openat_file_read(filename, &__items_fd[i], &__items_file_size[i]);
+
+            snprintf(filename, std::size(filename), "endoffset_%u", i);
+            openat_file_read(filename, &__endoffsets_fd[i], &__endoffsets_file_size[i]);
+            __endoffsets_ptr[i] = (uint64_t*)my_mmap(
+                __endoffsets_file_size[i],
+                PROT_READ,
+                MAP_PRIVATE | MAP_POPULATE,
+                __endoffsets_fd[i],
+                0);
+            DEBUG("__endoffsets_ptr[%u]=%p", i, __endoffsets_ptr[i]);
+        }
+    });
+
+    static std::atomic_uint32_t __g_queries_curr { 0 };
+    while (true) {
+        const uint32_t task_id = __g_queries_curr++;
+        if (task_id >= g_query_count) break;
+        const uint32_t qid = g_tasks_to_query[task_id];
+        query_t& query = g_queries[qid];
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+        const date_t d_scan_total = query.d_scan_end - query.d_pretopn_end 
+                                    + query.d_pretopn_begin - query.d_scan_begin;
+#else
+        const date_t d_scan_total = query.d_scan_end - query.d_scan_begin;
+#endif
+        date_item_range_queue& di_range_queue = g_di_range_queues_of_query[qid];
+        if (d_scan_total <= 0 || query.q_topn <= 0) {
+            di_range_queue.mark_push_finish();
+            continue;
+        }
+        ASSERT(query.item_buffer == nullptr);
+        ASSERT(query.item_size_buffer == nullptr);
+        const uint32_t max_buf_item_size = g_meta.max_bucket_actual_size_up_aligned / sizeof(uint32_t);
+        query.item_buffer = new uint32_t[max_buf_item_size * g_meta.partial_index_count * d_scan_total];
+        query.item_size_buffer = new uint32_t[g_meta.partial_index_count * d_scan_total];
+        uint32_t buf_item_off = 0;
+        date_t d_offset = 0;
+        const auto mmap_date_item_range = [&](const date_t d_begin, const date_t d_end) {
+            // DEBUG("loader%u mmap di_range[%u,%u), query%u task_id%u", tid, d_begin, d_end, qid, task_id);
+            date_item_range_t di_range;
+            for (date_t orderdate = d_begin; orderdate < d_end; ++orderdate, ++d_offset) {
+                // DEBUG("loader%u mmap orderdate%u, qid=%u", tid, orderdate, qid);
+                di_range.orderdate = orderdate;
+                di_range.d_offset = d_offset;
+                const uint32_t bucket = calc_bucket_index(query.q_mktid, orderdate);
+                const uint64_t scan_begin_offset = (uint64_t)bucket * CONFIG_INDEX_SPARSE_SIZE_PER_BUCKET;
+                for (uint32_t i = 0; i < g_meta.partial_index_count; ++i, ++buf_item_off) {
+                    uint32_t item_size = __endoffsets_ptr[i][bucket] - scan_begin_offset;
+                    const size_t read_size = C_CALL(pread(__items_fd[i], (void*)&query.item_buffer[max_buf_item_size * buf_item_off], item_size, scan_begin_offset));
+                    ASSERT(read_size == item_size);
+                    query.item_size_buffer[buf_item_off] = item_size / sizeof(uint32_t);
+                }
+                di_range_queue.push(di_range);
+            }
+        };
+#if CONFIG_TOPN_DATES_PER_PLATE > 0
+        ASSERT(query.d_scan_begin <= query.d_pretopn_begin);
+        ASSERT(query.d_pretopn_begin <= query.d_pretopn_end);
+        ASSERT(query.d_pretopn_end <= query.d_scan_end);
+        // query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
+        mmap_date_item_range(query.d_scan_begin, query.d_pretopn_begin);
+        mmap_date_item_range(query.d_pretopn_end, query.d_scan_end);
+#else
+        ASSERT(query.d_scan_begin <= query.d_scan_end);
+        // query.date_item_meta.resize(d_scan_total * g_meta.partial_index_count);
+        mmap_date_item_range(query.d_scan_begin, query.d_scan_end);
+#endif
+        di_range_queue.mark_push_finish();
+    }
+
+    g_loader_sync_barrier.sync_and_run_once([]() {
+        // TODO: cleanup
+
+        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
+            g_queries_done[qid].wait_done();
+
+            // print query
+            const query_t& query = g_queries[qid];
+            const size_t cnt = fwrite(query.output.data(), sizeof(char), query.output.length(), stdout);
+            CHECK(cnt == query.output.length());
+            DEBUG("query%u result length%u, done", qid, query.output.length());
+            if (query.item_buffer != nullptr) delete [] query.item_buffer;
+            if (query.item_size_buffer != nullptr) delete [] query.item_size_buffer;
+        }
+        C_CALL(fflush(stdout));
+    });
+
 }

@@ -163,6 +163,9 @@ int main(int argc, char* argv[])
         }
     }
 
+// #if CONFIG_TOPN_DATES_PER_PLATE > 0
+//     for (std::thread& thr : g_pretopn_threads) thr.join();
+// #endif
 
     //
     // Wait for worker and loader threads
