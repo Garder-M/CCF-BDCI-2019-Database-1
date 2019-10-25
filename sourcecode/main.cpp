@@ -125,6 +125,7 @@ int main(int argc, char* argv[])
         for (uint32_t tid = 0; tid < g_pretopn_sync_barrier.thread_count(); ++tid) {
             g_pretopn_threads.emplace_back(fn_pretopn_thread_use_index, tid);
         }
+        for (std::thread& thr : g_pretopn_threads) thr.join();
 #endif
     }
 
@@ -163,14 +164,11 @@ int main(int argc, char* argv[])
     }
 
 
-#if CONFIG_TOPN_DATES_PER_PLATE > 0
-        for (std::thread& thr : g_pretopn_threads) thr.join();
-#endif
     //
     // Wait for worker and loader threads
     //
-    for (std::thread& thr : g_loader_threads) thr.join();
     for (std::thread& thr : g_worker_threads) thr.join();
+    for (std::thread& thr : g_loader_threads) thr.join();
 
 
     //
