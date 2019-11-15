@@ -43,6 +43,8 @@ typedef unsigned __int128 uint128_t;
 typedef uint32_t index32_t;
 typedef uint64_t index64_t;
 
+typedef uint8_t  byte_t;
+
 #if !defined(PAGE_SIZE)
 #define PAGE_SIZE   (4096)
 #endif
@@ -151,6 +153,7 @@ struct query_result_t {
 #define SHMKEY_CUSTKEY_TO_MKTID     ((key_t)0x19491004)
 #define SHMKEY_ORDERKEY_TO_ORDER    ((key_t)0x19491005)
 #define SHMKEY_ORDERKEY_TO_CUSTKEY  ((key_t)0x19491006)
+#define SHMKEY_BUFFER_PACKER        ((key_t)0x19491007)
 
 //==============================================================================
 // Global Variables
@@ -197,6 +200,94 @@ public:
 #if ENABLE_ASSERTION
     std::atomic_uint64_t customer_file_loaded_parts { 0 };
 #endif
+};
+
+class shared_buffer_packer {
+public:
+    struct record_t {
+        bool is_external;
+        uint64_t offset;
+        uintptr_t addr;
+    };
+
+    DISABLE_COPY_MOVE_CONSTRUCTOR(shared_buffer_packer);
+    shared_buffer_packer() noexcept = default;
+
+    __always_inline
+    void init(uint64_t size) noexcept
+    {
+        bool success = _shm_buffer.init_fixed(SHMKEY_BUFFER_PACKER, size, true);
+        CHECK(success);
+        _capacity = size;
+        _size = 0;
+        _register_done = false;
+        _shm_buffer.attach_fixed(false);
+    }
+
+    __always_inline
+    uint64_t register_external(uintptr_t addr, uint64_t size) noexcept
+    {
+        ASSERT(!_register_done);
+        const uint64_t aligned_size = (size + 64 - 1) / 64 * 64;
+        const uint64_t offset = _size;
+        _size += aligned_size;
+        ASSERT(_size <= _capacity);
+        *addr = _shm_buffer.ptr + offset;
+        record_t record;
+        record.is_external = true;
+        record.offset = offset;
+        record.addr = addr;
+        _records.push_back(record);
+        return offset;
+    }
+
+    __always_inline
+    uint64_t register_internal(uint64_t internal_offset, uint64_t size) noexcept
+    {
+        ASSERT(!_register_done);
+        const uint64_t aligned_size = (size + 64 - 1) / 64 * 64;
+        const uint64_t offset = _size;
+        _size += aligned_size;
+        ASSERT(_size <= _capacity);
+        uintptr_t addr = _shm_buffer.ptr + internal_offset;
+        *addr = _shm_buffer.ptr + offset;
+        record_t record;
+        record.is_external = false;
+        record.offset = offset;
+        record.addr = internal_offset;
+        _records.push_back(record);
+        return offset;
+    }
+
+    __always_inline
+    void mark_register_done() noexcept
+    {
+        ASSERT(!_register_done);
+        _register_done = true;
+    }
+
+    __always_inline
+    void hook() noexcept
+    {
+        ASSERT(_register_done, "pls mark register done before hook");
+        _shm_buffer.attach_fixed(false);
+        for (const record_t& record : _records) {
+            if (record.is_external) {
+                *(record.addr) = _shm_buffer.ptr + record.offset;
+            }
+            else {
+                const uintptr_t addr = _shm_buffer.ptr + record.addr;
+                *addr = _shm_buffer.ptr + record.offset;
+            }
+        }
+    }
+
+private:
+    posix_shm_t<byte_t> _shm_buffer;
+    uint64_t _capacity;
+    uint64_t _size;
+    bool _register_done;
+    std::vector<record_t> _records;
 };
 
 inline shared_information_t* g_shared = nullptr;
