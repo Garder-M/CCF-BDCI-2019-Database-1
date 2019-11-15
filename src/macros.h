@@ -39,6 +39,8 @@
 #define __align_down(_A_, _B_)      ((_A_) / (_B_) * (_B_))
 
 
+#define __field_offset(_Type_, _F_) ((uintptr_t)&((_Type_*)nullptr)->_F_)
+
 
 inline std::chrono::steady_clock::time_point __program_startup_time = std::chrono::steady_clock::now();
 

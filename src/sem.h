@@ -2,7 +2,7 @@
 #define _BDCI19_SEMEPHORE_H_INCLUDED_
 
 #if !defined(__SEMAPHORE_DEBUG__)
-#define __SEMAPHORE_DEBUG__ 1
+#define __SEMAPHORE_DEBUG__ 0
 #endif  // !defined(__SEMAPHORE_DEBUG__)
 
 

@@ -189,6 +189,13 @@ public:
     uint32_t total_plates = 0;
     std::atomic_uint32_t pretopn_plate_id_shared_counter { 0 };
 
+    struct {
+        std::atomic_uint32_t parse_query_id_shared_counter { 0 };
+#if ENABLE_LOGGING_DEBUG
+        process_shared_mutex parse_query_id_logging_mutex { };
+#endif  // ENABLE_LOGGING_DEBUG
+    } use_index;
+
     process_shared_mutex meta_update_mutex { };
     struct {
         uint32_t max_shipdate_orderdate_diff = 0;
@@ -291,7 +298,6 @@ private:
 };
 
 inline shared_information_t* g_shared = nullptr;
-inline bool g_use_multi_process = false;
 inline uint32_t g_active_cpu_cores = 0;  // number of CPU cores
 inline uint32_t g_total_process_count = 0;  // process or thread count
 inline uint32_t g_id = 0;

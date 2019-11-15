@@ -197,12 +197,6 @@ static void do_multi_process() noexcept
 }
 
 
-static void do_multi_thread() noexcept
-{
-    PANIC("TODO: do_multi_thread() not implemented yet");
-}
-
-
 
 int main(int argc, char* argv[])
 {
@@ -266,22 +260,12 @@ int main(int argc, char* argv[])
     // Initialize g_shared
     //
     {
-        //g_use_multi_process = g_is_creating_index ? !g_is_preparing_page_cache : false;
-        g_use_multi_process = g_is_creating_index;
-        INFO("g_use_multi_process: %d", (int)g_use_multi_process);
-
-        if (g_use_multi_process) {
-            g_shared = (shared_information_t*)my_mmap(
-                sizeof(shared_information_t),
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
-                -1,
-                0);
-        }
-        else {
-            g_shared = (shared_information_t*)malloc(sizeof(shared_information_t));
-            CHECK(g_shared != nullptr, "malloc() failed");
-        }
+        g_shared = (shared_information_t*)my_mmap(
+            sizeof(shared_information_t),
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+            -1,
+            0);
         DEBUG("g_shared: %p", g_shared);
 
         new (g_shared) shared_information_t;
@@ -311,17 +295,12 @@ int main(int argc, char* argv[])
         // How many processes do we use?
         g_total_process_count = g_active_cpu_cores;
         DEBUG("g_total_process_count: %u", g_total_process_count);
-        g_shared->worker_sync_barrier.init(g_total_process_count, g_use_multi_process);
-        g_shared->loader_sync_barrier.init(g_total_process_count, g_use_multi_process);
+        g_shared->worker_sync_barrier.init(g_total_process_count, /*use_multi_process*/true);
+        g_shared->loader_sync_barrier.init(g_total_process_count, /*use_multi_process*/true);
     }
 
 
-    if (g_use_multi_process) {
-        do_multi_process();
-    }
-    else {
-        do_multi_thread();
-    }
+    do_multi_process();
 
     INFO("======== exit ========");
     return 0;
