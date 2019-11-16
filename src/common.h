@@ -211,8 +211,8 @@ public:
 
 class shared_buffer_packer {
 public:
-    const constexpr uint64_t std_buffer_size = 20 * 1024 * 1024;
-    const constexpr uint64_t max_buffer_size = 1024 * 1024 * 1024;
+    static const constexpr uint64_t std_buffer_size = 20 * 1024 * 1024;
+    static const constexpr uint64_t max_buffer_size = 1024 * 1024 * 1024;
     struct buffer_t {
         uint64_t capacity;
         uint64_t size;
@@ -249,7 +249,7 @@ public:
         buffer_t& buffer = _buffers[bufferid];
         const uint64_t offset = buffer.size;
         buffer.size += aligned_size;
-        *addr = buffer.shm_buffer.ptr + offset;
+        *(uintptr_t*)addr = (uintptr_t)buffer.shm_buffer.ptr + offset;
         record.bufferid = bufferid;
         record.offset = offset;
         record.addr = addr;
@@ -270,8 +270,8 @@ public:
         buffer.size += aligned_size;
         const uint32_t internal_bufferid = internal_tag / max_buffer_size;
         const uint64_t internal_offset = internal_tag % max_buffer_size;
-        uintptr_t addr = _buffers[internal_bufferid].shm_buffer.ptr + internal_offset;
-        *addr = buffer.shm_buffer.ptr + offset;
+        uintptr_t addr = (uintptr_t)_buffers[internal_bufferid].shm_buffer.ptr + internal_offset;
+        *(uintptr_t*)addr = (uintptr_t)buffer.shm_buffer.ptr + offset;
         record.bufferid = bufferid;
         record.offset = offset;
         record.addr = internal_tag;
@@ -312,7 +312,7 @@ public:
         for (const record_t& record : _records) {
             const buffer_t& buffer = _buffers[record.bufferid];
             if (record.is_external) {
-                *(record.addr) = buffer.shm_buffer.ptr + record.offset;
+                *(uintptr_t*)record.addr = (uintptr_t)buffer.shm_buffer.ptr + record.offset;
             }
             else {
                 // const uintptr_t addr = _shm_buffer.ptr + record.addr;
@@ -320,8 +320,8 @@ public:
                 const uint64_t internal_tag = record.addr;
                 const uint32_t internal_bufferid = internal_tag / max_buffer_size;
                 const uint64_t internal_offset = internal_tag % max_buffer_size;
-                uintptr_t addr = _buffers[internal_bufferid].shm_buffer.ptr + internal_offset;
-                *addr = buffer.shm_buffer.ptr + record.offset;
+                uintptr_t addr = (uintptr_t)_buffers[internal_bufferid].shm_buffer.ptr + internal_offset;
+                *(uintptr_t*)addr = (uintptr_t)buffer.shm_buffer.ptr + record.offset;
             }
         }
     }
@@ -331,7 +331,7 @@ private:
     uint32_t find_or_create_buffer(const uint64_t aligned_size) noexcept
     {
         ASSERT(aligned_size <= max_buffer_size);
-        const uint32_t bufferid = 0;
+        uint32_t bufferid = 0;
         bool success = false;
         for (uint32_t i = 0; i < _buffers.size(); ++i) {
             buffer_t& buffer = _buffers[i];
@@ -343,13 +343,13 @@ private:
         }
         if (!success) {
             const uint64_t aligned_2m_size = __align_up(aligned_size, MMAP_ALIGNMENT_2MB);
-            const uint64_t buffer_size = (aligned_2m_size <= std_buffer_size) ? std_buffer_size : aligned_size;
+            const uint64_t buffer_size = (aligned_2m_size <= std_buffer_size) ? std_buffer_size : aligned_2m_size;
             bufferid = _buffers.size();
             _buffers.resize(_buffers.size() + 1);
             buffer_t& buffer = _buffers[bufferid];
             bool ok = buffer.shm_buffer.init_fixed(SHMKEY_BUFFER_PACKER_BEGIN+bufferid, buffer_size, true);
             CHECK(ok);
-            buffer.shm_buffer.attach_fixed(false);
+            buffer.shm_buffer.attach_fixed(true);
             buffer.capacity = buffer_size;
             buffer.size = 0;
             success = true;
@@ -358,8 +358,6 @@ private:
     }
 
     std::vector<buffer_t> _buffers { };
-    // uint64_t _capacity;
-    // uint64_t _size;
     std::vector<record_t> _records { };
     bool _register_done = false;
 };
