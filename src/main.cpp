@@ -151,6 +151,7 @@ static void do_multi_process() noexcept
     //
     std::thread worker_thread;
     std::thread unloader_thread;
+    std::thread pretopn_thread;
     {
         worker_thread = std::thread([&]() {
 #if ENABLE_PIN_THREAD_TO_CPU
@@ -171,6 +172,17 @@ static void do_multi_process() noexcept
 #endif
             (g_is_creating_index ? fn_unloader_thread_create_index : fn_unloader_thread_use_index)();
         });
+        if (!g_is_creating_index) {
+            unloader_thread = std::thread([&]() {
+#if ENABLE_PIN_THREAD_TO_CPU
+                pin_thread_to_cpu_core(g_id);
+#endif
+#if ENABLE_ATTEMPT_SCHED_FIFO
+                set_thread_fifo_scheduler(CONFIG_SCHED_FIFO_UNLOADER_NICE);
+#endif
+                fn_pretopn_thread_use_index(g_id);
+            });
+        }
     }
 
 
@@ -187,6 +199,9 @@ static void do_multi_process() noexcept
         (g_is_creating_index ? fn_loader_thread_create_index : fn_loader_thread_use_index)(g_id);
     }
 
+    if (!g_is_creating_index) {
+        pretopn_thread.join();
+    }
 
     //
     // Wait for loader thread

@@ -207,6 +207,11 @@ public:
 #if ENABLE_ASSERTION
     std::atomic_uint64_t customer_file_loaded_parts { 0 };
 #endif
+
+    // following items are only used in use_index
+    std::atomic_uint32_t shared_pretopn_d_ranges_curr { 0 };
+    std::atomic_uint32_t pretopn_queries_curr { 0 };
+    std::atomic_uint32_t queries_curr { 0 };
 };
 
 class shared_buffer_packer {
@@ -416,6 +421,7 @@ void create_index_initialize_after_fork() noexcept;
 //==============================================================================
 // Functions in use_index.cpp
 //==============================================================================
+void fn_pretopn_thread_use_index(const uint32_t tid) noexcept;
 void fn_loader_thread_use_index(const uint32_t tid) noexcept;
 void fn_worker_thread_use_index(const uint32_t tid) noexcept;
 void fn_unloader_thread_use_index() noexcept;
@@ -435,6 +441,16 @@ uint32_t calc_bucket_index(const uint8_t mktid, const date_t orderdate) noexcept
     ASSERT(orderdate <= MAX_TABLE_DATE);
 
     return (uint32_t)(mktid - 0) * BUCKETS_PER_MKTID + (orderdate - MIN_TABLE_DATE) / CONFIG_ORDERDATES_PER_BUCKET;
+}
+
+__always_inline
+uint32_t calc_topn_plate_index(const uint8_t mktid, const date_t orderdate) noexcept
+{
+    ASSERT(orderdate >= MIN_TABLE_DATE);
+    ASSERT(orderdate <= MAX_TABLE_DATE);
+    ASSERT((orderdate - MIN_TABLE_DATE) % CONFIG_TOPN_DATES_PER_PLATE == 0);
+
+    return (uint32_t)(mktid - 0) * PLATES_PER_MKTID + (uint32_t)(orderdate - MIN_TABLE_DATE) / CONFIG_TOPN_DATES_PER_PLATE;
 }
 
 __always_inline
