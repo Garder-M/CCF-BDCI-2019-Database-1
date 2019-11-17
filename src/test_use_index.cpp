@@ -81,6 +81,8 @@ namespace
     uint32_t* g_major_workload_mmap_base_ptr = nullptr;
     uint64_t g_major_workload_mmap_size;
 
+    process_shared_semaphore g_working_sem;
+
 }
 
 __always_inline
@@ -606,6 +608,7 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         if (task_id >= g_query_count) break;
         const uint32_t qid = g_tasks_to_query[task_id];
         g_curr_working_qid = qid;
+        g_working_sem.post();
         query_t& query = g_queries[qid];
 
         const auto mmap_date_range_major_workload = [&](const date_t d_aligned_begin, const date_t d_alignd_end, const uint8_t type) {
@@ -717,7 +720,7 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
 void fn_worker_thread_use_index(const uint32_t tid) noexcept
 {
     while (true) {
-        // TODO: wait for semaphore...
+        g_working_sem.wait();
 
         const uint32_t qid = g_curr_working_qid;
         query_t& query = g_queries[qid];
@@ -728,6 +731,195 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
         uint32_t* p;
         uint32_t* end;
         date_t base_orderdate;
+
+        const auto scan_major_workload_type0 = [&]() {
+            const __m256i expend_mask = _mm256_set_epi32(
+                0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+                0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
+            __m256i greater_than_value;
+            // if (base_orderdate > q_shipdate) {
+            //     greater_than_value = _mm256_set1_epi32(0);  // TODO: dummy. remove!
+            // }
+            // else if (q_shipdate - base_orderdate >= 128) {
+            //     greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
+            // }
+            // else {  // base_orderdate <= q_shipdate < base_orderdate + 128
+            //     greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);  // TODO: dummy. remove!
+            // }
+            greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);
+            // const uint32_t* const end_align32 = p + __align_down(bucket_size_major / sizeof(uint32_t), 32);
+            uint32_t count = 0;
+            __m256i items1, items2, items3, items4;
+            uint32_t orderkey1, orderkey2, orderkey3, orderkey4;
+            date_t orderdate1, orderdate2, orderdate3, orderdate4;
+            while (p < end) {
+                while (p < end) {
+                    const uint32_t orderdate_diff1 = *(p + 7) >> 30;
+                    orderdate1 = base_orderdate + orderdate_diff1;
+                    if (orderdate1 < query.d_scan_begin || orderdate1 >= query.d_scan_end) {
+                        p += 8;
+                        continue;
+                    }
+                    else {
+                        orderkey1 = *(p + 7) & ~0xC0000000U;
+                        items1 = _mm256_load_si256((__m256i*)p);
+                        p += 8;
+                        const __m256i gt_mask1 = _mm256_cmpgt_epi32(items1, greater_than_value);
+                        if (_mm256_testz_si256(gt_mask1, gt_mask1)) continue;
+                        items1 = _mm256_and_si256(items1, gt_mask1);
+                        items1 = _mm256_and_si256(items1, expend_mask);
+                        ++count;
+                        break;
+                    }
+                }
+                if (p >= end) break;
+
+                while (p < end) {
+                    const uint32_t orderdate_diff2 = *(p + 7) >> 30;
+                    orderdate2 = base_orderdate + orderdate_diff2;
+                    if (orderdate2 < query.d_scan_begin || orderdate2 >= query.d_scan_end) {
+                        p += 8;
+                        continue;
+                    }
+                    else {
+                        orderkey2 = *(p + 7) & ~0xC0000000U;
+                        items2 = _mm256_load_si256((__m256i*)p);
+                        p += 8;
+                        const __m256i gt_mask2 = _mm256_cmpgt_epi32(items2, greater_than_value);
+                        if (_mm256_testz_si256(gt_mask2, gt_mask2)) continue;
+                        items2 = _mm256_and_si256(items2, gt_mask2);
+                        items2 = _mm256_and_si256(items2, expend_mask);
+                        ++count;
+                        break;
+                    }
+                }
+                if (p >= end) break;
+
+                while (p < end) {
+                    const uint32_t orderdate_diff3 = *(p + 7) >> 30;
+                    orderdate3 = base_orderdate + orderdate_diff3;
+                    if (orderdate3 < query.d_scan_begin || orderdate3 >= query.d_scan_end) {
+                        p += 8;
+                        continue;
+                    }
+                    else {
+                        orderkey3 = *(p + 7) & ~0xC0000000U;
+                        items3 = _mm256_load_si256((__m256i*)p);
+                        p += 8;
+                        const __m256i gt_mask3 = _mm256_cmpgt_epi32(items3, greater_than_value);
+                        if (_mm256_testz_si256(gt_mask3, gt_mask3)) continue;
+                        items3 = _mm256_and_si256(items3, gt_mask3);
+                        items3 = _mm256_and_si256(items3, expend_mask);
+                        ++count;
+                        break;
+                    }
+                }
+                if (p >= end) break;
+
+                while (p < end) {
+                    const uint32_t orderdate_diff4 = *(p + 7) >> 30;
+                    orderdate4 = base_orderdate + orderdate_diff4;
+                    if (orderdate4 < query.d_scan_begin || orderdate4 >= query.d_scan_end) {
+                        p += 8;
+                        continue;
+                    }
+                    else {
+                        orderkey4 = *(p + 7) & ~0xC0000000U;
+                        items4 = _mm256_load_si256((__m256i*)p);
+                        p += 8;
+                        const __m256i gt_mask4 = _mm256_cmpgt_epi32(items4, greater_than_value);
+                        if (_mm256_testz_si256(gt_mask4, gt_mask4)) continue;
+                        items4 = _mm256_and_si256(items4, gt_mask4);
+                        items4 = _mm256_and_si256(items4, expend_mask);
+                        ++count;
+                        break;
+                    }
+                }
+                if (p >= end) break;
+
+                // TODO: looks for better way!
+                // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
+                const __m256i tmp1 = _mm256_hadd_epi32(items1, items2);
+                const __m256i tmp2 = _mm256_hadd_epi32(items3, items4);
+                const __m256i tmp3 = _mm256_hadd_epi32(tmp1, tmp2);
+                const __m128i tmp3lo = _mm256_castsi256_si128(tmp3);
+                const __m128i tmp3hi = _mm256_extracti128_si256(tmp3, 1);
+                const __m128i sum = _mm_add_epi32(tmp3hi, tmp3lo);
+
+                const uint32_t total_expend_cent1 = _mm_extract_epi32(sum, 0);
+                const uint32_t total_expend_cent2 = _mm_extract_epi32(sum, 1);
+                const uint32_t total_expend_cent3 = _mm_extract_epi32(sum, 2);
+                const uint32_t total_expend_cent4 = _mm_extract_epi32(sum, 3);
+
+#define _CHECK_RESULT(N) \
+                ASSERT(total_expend_cent##N > 0); \
+                if (total_expend_cent##N > 0) { \
+                    query_result_t tmp; \
+                    tmp.orderdate = orderdate##N; \
+                    tmp.orderkey = orderkey##N; \
+                    tmp.total_expend_cent = total_expend_cent##N; \
+                    \
+                    if (query.result_size < query.q_topn) { \
+                        query.result[query.result_size++] = tmp; \
+                        if (__unlikely(query.result_size == query.q_topn)) { \
+                            std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                        } \
+                    } \
+                    else { \
+                        if (tmp > query.result[0]) { \
+                            std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                            query.result[query.result_size - 1] = tmp; \
+                            std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                        } \
+                    } \
+                }
+
+                _CHECK_RESULT(1)
+                _CHECK_RESULT(2)
+                _CHECK_RESULT(3)
+                _CHECK_RESULT(4)
+#undef _CHECK_RESULT
+            }
+
+#define _CHECK_ITEM_RESULT(N) {\
+                __m256i sum = _mm256_hadd_epi32(items##N, items##N); \
+                sum = _mm256_hadd_epi32(sum, sum); \
+                const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4); \
+                ASSERT(total_expend_cent > 0); \
+                \
+                query_result_t tmp; \
+                tmp.orderdate = orderdate##N; \
+                tmp.orderkey = orderkey##N; \
+                tmp.total_expend_cent = total_expend_cent; \
+                \
+                if (query.result_size < query.q_topn) { \
+                    query.result[query.result_size++] = tmp; \
+                    if (__unlikely(query.result_size == query.q_topn)) { \
+                        std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                    } \
+                } \
+                else { \
+                    if (tmp > query.result[0]) { \
+                        std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                        query.result[query.result_size - 1] = tmp; \
+                        std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                    } \
+                } \
+            }
+
+            switch (count % 4) {
+            case 3: 
+                _CHECK_ITEM_RESULT(3)
+            case 2:
+                _CHECK_ITEM_RESULT(2)
+            case 1:
+                _CHECK_ITEM_RESULT(1)
+            }
+#undef _CHECK_ITEM_RESULT
+
+        };
+
+
         const auto scan_major_workload_type12 = [&](uint8_t type) {
             ASSERT(type == 1 || type == 2);
             const __m256i expend_mask = _mm256_set_epi32(
