@@ -21,7 +21,8 @@ struct query_t
     bool is_unknown_mktsegment;
     query_result_t* result = nullptr;
     uint32_t result_size;
-    // std::string output;
+    char* output = nullptr;
+    uint32_t output_size;
     // uint32_t* item_buffer = nullptr;
     // uint32_t* item_size_buffer = nullptr;
 };
@@ -142,6 +143,12 @@ void parse_queries() noexcept
         );
         ASSERT(query.result != nullptr);
         query.result_size = 0;
+        g_buffer_packer.register_internal(
+            shm_tag_g_queries + q * sizeof(query_t) + __field_offset(query_t, output),
+            (query.q_topn + 1) * 40
+        ); // max line length: ~32, reserved to 40 for safety
+        ASSERT(query.output != nullptr);
+        query.output_size = 0;
 
         query.d_scan_begin = std::min<date_t>(std::max<date_t>(
             query.q_shipdate - (g_shared->meta.max_shipdate_orderdate_diff - 1),
@@ -472,7 +479,7 @@ void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
 
             if (query.result_size < query.q_topn) {
                 query.result[query.result_size++] = tmp;
-                if (query.result_size == query.q_topn) {
+                if (__unlikely(query.result_size == query.q_topn)) {
                     std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
                 }
             }
@@ -692,37 +699,267 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         continue;
     }
 
-    // g_loader_sync_barrier.sync_and_run_once([]() {
-    //     // TODO: cleanup
-    //     for (uint32_t i = 0; i < g_meta.partial_index_count; ++i) {
-    //         C_CALL(close(__items_fd[i]));
-    //         C_CALL(close(__endoffsets_fd[i]));
-    //         C_CALL(munmap((void*)__endoffsets_ptr[i], __endoffsets_file_size[i]));
-    //     }
-    //     delete [] __items_fd;
-    //     delete [] __endoffsets_fd;
-    //     delete [] __items_file_size;
-    //     delete [] __endoffsets_file_size;
-    //     delete [] __endoffsets_ptr;
+    g_shared->loader_sync_barrier.sync_and_run_once([]() {
+        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
+            g_queries_done[qid].wait_done();
 
-    //     for (uint32_t qid = 0; qid < g_query_count; ++qid) {
-    //         g_queries_done[qid].wait_done();
-
-    //         // print query
-    //         const query_t& query = g_queries[qid];
-    //         const size_t cnt = fwrite(query.output.data(), sizeof(char), query.output.length(), stdout);
-    //         CHECK(cnt == query.output.length());
-    //         DEBUG("query%u result length%u, done", qid, query.output.length());
-    //         if (query.item_buffer != nullptr) delete [] query.item_buffer;
-    //         if (query.item_size_buffer != nullptr) delete [] query.item_size_buffer;
-    //     }
-    //     C_CALL(fflush(stdout));
-    // });
+            // print query
+            const query_t& query = g_queries[qid];
+            const size_t cnt = fwrite(query.output, sizeof(char), query.output_size, stdout);
+            CHECK(cnt == query.output_size);
+            DEBUG("query%u result length%u, done", qid, query.output_size);
+        }
+        C_CALL(fflush(stdout));
+    });
 
 }
 
 void fn_worker_thread_use_index(const uint32_t tid) noexcept
 {
+    while (true) {
+        // TODO: wait for semaphore...
+
+        const uint32_t qid = g_curr_working_qid;
+        query_t& query = g_queries[qid];
+        g_pretopn_queries_done[qid].wait_done();
+
+        const date_t q_shipdate = query.q_shipdate;
+        uint64_t bucket_size_major;
+        uint32_t* p;
+        uint32_t* end;
+        date_t base_orderdate;
+        const auto scan_major_workload_type12 = [&](uint8_t type) {
+            ASSERT(type == 1 || type == 2);
+            const __m256i expend_mask = _mm256_set_epi32(
+                0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+                0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
+            __m256i greater_than_value;
+            // if (base_orderdate > q_shipdate) {
+            //     greater_than_value = _mm256_set1_epi32(0);  // TODO: dummy. remove!
+            // }
+            // else if (q_shipdate - base_orderdate >= 128) {
+            //     greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
+            // }
+            // else {  // base_orderdate <= q_shipdate < base_orderdate + 128
+            //     greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);  // TODO: dummy. remove!
+            // }
+            if (type == 1) {
+                greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);
+            }
+            const uint32_t* const end_align32 = p + __align_down(bucket_size_major / sizeof(uint32_t), 32);
+            while (p < end_align32) {
+                const uint32_t orderdate_diff1 = *(p + 7) >> 30;
+                const date_t orderdate1 = base_orderdate + orderdate_diff1;
+                const uint32_t orderkey1 = *(p + 7) & ~0xC0000000U;
+                __m256i items1 = _mm256_load_si256((__m256i*)p);
+                p += 8;
+                if (type == 1) {
+                    const __m256i gt_mask1 = _mm256_cmpgt_epi32(items1, greater_than_value);
+                    items1 = _mm256_and_si256(items1, gt_mask1);
+                }
+                items1 = _mm256_and_si256(items1, expend_mask);
+
+                const uint32_t orderdate_diff2 = *(p + 7) >> 30;
+                const date_t orderdate2 = base_orderdate + orderdate_diff2;
+                const uint32_t orderkey2 = *(p + 7) & ~0xC0000000U;
+                __m256i items2 = _mm256_load_si256((__m256i*)p);
+                p += 8;
+                if (type == 1) {
+                    const __m256i gt_mask2 = _mm256_cmpgt_epi32(items2, greater_than_value);
+                    items2 = _mm256_and_si256(items2, gt_mask2);
+                }
+                items2 = _mm256_and_si256(items2, expend_mask);
+
+                const uint32_t orderdate_diff3 = *(p + 7) >> 30;
+                const date_t orderdate3 = base_orderdate + orderdate_diff3;
+                const uint32_t orderkey3 = *(p + 7) & ~0xC0000000U;
+                __m256i items3 = _mm256_load_si256((__m256i*)p);
+                p += 8;
+                if (type == 1) {
+                    const __m256i gt_mask3 = _mm256_cmpgt_epi32(items3, greater_than_value);
+                    items3 = _mm256_and_si256(items3, gt_mask3);
+                }
+                items3 = _mm256_and_si256(items3, expend_mask);
+
+                const uint32_t orderdate_diff4 = *(p + 7) >> 30;
+                const date_t orderdate4 = base_orderdate + orderdate_diff4;
+                const uint32_t orderkey4 = *(p + 7) & ~0xC0000000U;
+                __m256i items4 = _mm256_load_si256((__m256i*)p);
+                p += 8;
+                if (type == 1) {
+                    const __m256i gt_mask4 = _mm256_cmpgt_epi32(items4, greater_than_value);
+                    items4 = _mm256_and_si256(items4, gt_mask4);
+                }
+                items4 = _mm256_and_si256(items4, expend_mask);
+
+                // TODO: looks for better way!
+                // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
+                const __m256i tmp1 = _mm256_hadd_epi32(items1, items2);
+                const __m256i tmp2 = _mm256_hadd_epi32(items3, items4);
+                const __m256i tmp3 = _mm256_hadd_epi32(tmp1, tmp2);
+                const __m128i tmp3lo = _mm256_castsi256_si128(tmp3);
+                const __m128i tmp3hi = _mm256_extracti128_si256(tmp3, 1);
+                const __m128i sum = _mm_add_epi32(tmp3hi, tmp3lo);
+
+                const uint32_t total_expend_cent1 = _mm_extract_epi32(sum, 0);
+                const uint32_t total_expend_cent2 = _mm_extract_epi32(sum, 1);
+                const uint32_t total_expend_cent3 = _mm_extract_epi32(sum, 2);
+                const uint32_t total_expend_cent4 = _mm_extract_epi32(sum, 3);
+
+#define _CHECK_RESULT(N) \
+                if (total_expend_cent##N > 0) { \
+                    query_result_t tmp; \
+                    tmp.orderdate = orderdate##N; \
+                    tmp.orderkey = orderkey##N; \
+                    tmp.total_expend_cent = total_expend_cent##N; \
+                    \
+                    if (query.result_size < query.q_topn) { \
+                        query.result[query.result_size++] = tmp; \
+                        if (__unlikely(query.result_size == query.q_topn)) { \
+                            std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                        } \
+                    } \
+                    else { \
+                        if (tmp > query.result[0]) { \
+                            std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                            query.result[query.result_size - 1] = tmp; \
+                            std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
+                        } \
+                    } \
+                }
+
+                _CHECK_RESULT(1)
+                _CHECK_RESULT(2)
+                _CHECK_RESULT(3)
+                _CHECK_RESULT(4)
+#undef _CHECK_RESULT
+            }
+
+
+            while (p < end) {
+                const uint32_t orderdate_diff = *(p + 7) >> 30;
+                const date_t orderdate = base_orderdate + orderdate_diff;
+                const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
+
+                __m256i items = _mm256_load_si256((__m256i*)p);
+                p += 8;
+
+                if (type == 1) {
+                    const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
+                    if (_mm256_testz_si256(gt_mask, gt_mask)) continue;
+
+                    items = _mm256_and_si256(items, gt_mask);
+                }
+                items = _mm256_and_si256(items, expend_mask);
+
+                // TODO: looks for better way!
+                // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
+                __m256i sum = _mm256_hadd_epi32(items, items);
+                sum = _mm256_hadd_epi32(sum, sum);
+                const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
+                ASSERT(total_expend_cent > 0);
+
+                query_result_t tmp;
+                tmp.orderdate = orderdate;
+                tmp.orderkey = orderkey;
+                tmp.total_expend_cent = total_expend_cent;
+
+                if (query.result_size < query.q_topn) {
+                    query.result[query.result_size++] = tmp;
+                    if (__unlikely(query.result_size == query.q_topn)) {
+                        std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                    }
+                }
+                else {
+                    if (tmp > query.result[0]) {
+                        std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                        query.result[query.result_size - 1] = tmp;
+                        std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                    }
+                }
+            }
+        };
+
+        workload_info_t workload_info;
+        while (g_major_workload_info_queue.pop(&workload_info)) {
+            base_orderdate = workload_info.orderdate;
+            const uint32_t bucket_id = calc_bucket_index(query.q_mktid, base_orderdate);
+            const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
+            const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
+
+            const uintptr_t bucket_start_offset_major = (uint64_t)CONFIG_INDEX_SPARSE_BUCKET_SIZE_MAJOR * (bucket_id - begin_bucket_id);
+            bucket_size_major = g_endoffset_major_ptr[bucket_id] - bucket_start_offset_major;
+            p = (uint32_t*)((uintptr_t)g_major_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_major_workload_mmap_size));
+            end = (uint32_t*)((uintptr_t)p + (uintptr_t)bucket_size_major);
+            ASSERT(bucket_size_major % (8 * sizeof(uint32_t)) == 0);
+
+            switch(workload_info.type) {
+            case 0:
+                // TODO: implement scan_major_workload_type0();
+                break;
+            case 1:
+                // break;
+            case 2:
+                scan_major_workload_type12(workload_info.type);
+                break;
+            default:
+                ASSERT(workload_info.type <= 2);
+            }
+
+            g_major_workload_index_bag.return_back(workload_info.index);
+        }
+        std::sort(&query.result[0], &query.result[query.result_size - 1], std::greater<>());
+
+        //
+        // print query to string
+        //
+        std::string output;
+        const auto append_u32 = [&](const uint32_t n) noexcept {
+            ASSERT(n > 0);
+            output += std::to_string(n);  // TODO: implement it!
+        };
+        const auto append_u32_width2 = [&](const uint32_t n) noexcept {
+            ASSERT(n <= 99);
+            output += (char)('0' + n / 10);
+            output += (char)('0' + n % 10);
+        };
+        const auto append_u32_width4 = [&](const uint32_t n) noexcept {
+            ASSERT(n <= 9999);
+            output += (char)('0' + (n       ) / 1000);
+            output += (char)('0' + (n % 1000) / 100);
+            output += (char)('0' + (n % 100 ) / 10);
+            output += (char)('0' + (n % 10 )  / 1);
+        };
+        output.reserve((size_t)(query.q_topn + 1) * 40);  // max line length: ~32, reserved to 40
+        output += "l_orderkey|o_orderdate|revenue\n";
+        for (uint32_t i = 0; i < query.result_size; ++i) {
+            //printf("%u|%u-%02u-%02u|%u.%02u\n",
+            //       line.orderkey,
+            //       std::get<0>(ymd), std::get<1>(ymd), std::get<2>(ymd),
+            //       line.total_expend_cent / 100, line.total_expend_cent % 100);
+            const query_result_t& line = query.result[i];
+            const auto ymd = date_get_ymd(line.orderdate);
+            append_u32(line.orderkey);
+            output += '|';
+            append_u32_width4(std::get<0>(ymd));
+            output += '-';
+            append_u32_width2(std::get<1>(ymd));
+            output += '-';
+            append_u32_width2(std::get<2>(ymd));
+            output += '|';
+            append_u32(line.total_expend_cent / 100);
+            output += '.';
+            append_u32_width2(line.total_expend_cent % 100);
+            output += '\n';
+        }
+        
+        query.output_size = output.size();
+        ASSERT(query.output_size <= (query.q_topn + 1) * 40);
+        memcpy(query.output, output.c_str(), query.output_size);
+
+        DEBUG("[%u] query #%u done", tid, qid);
+        g_queries_done[qid].mark_done();
+    }
 
 }
 
