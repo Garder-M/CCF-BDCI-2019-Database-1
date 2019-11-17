@@ -1087,7 +1087,7 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 
             switch(workload_info.type) {
             case 0:
-                // TODO: implement scan_major_workload_type0();
+                scan_major_workload_type0();
                 break;
             case 1:
                 // break;
