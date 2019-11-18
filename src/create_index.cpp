@@ -1299,7 +1299,8 @@ void worker_compute_pretopn_for_plate(
             ASSERT(total_expend_cent##N < (1U << 28)); \
             ASSERT(plate_orderdate_diff##N >= 0); \
             ASSERT(plate_orderdate_diff##N < (1 << 6)); \
-            const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(plate_orderdate_diff##N) << 30 | orderkey##N; \
+            /* const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(plate_orderdate_diff##N) << 30 | orderkey##N; */ \
+            const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(orderkey##N) << 6 | plate_orderdate_diff##N; \
             \
             if (topn_count < CONFIG_EXPECT_MAX_TOPN) { \
                 topn_ptr[topn_count++] = value; \
@@ -1447,12 +1448,8 @@ static void worker_compute_pretopn([[maybe_unused]] const uint32_t tid) noexcept
         const uint32_t plate_base_bucket_id = calc_plate_base_bucket_id_by_plate_id(plate_id);
         const uint32_t base_mktid = calc_bucket_mktid(plate_base_bucket_id);
 
-        const date_t bucket_base_orderdate = calc_bucket_base_orderdate_by_bucket_id(plate_base_bucket_id);
         const date_t plate_base_orderdate = calc_plate_base_orderdate_by_plate_id(plate_id);
         ASSERT((plate_base_orderdate - MIN_TABLE_DATE) % CONFIG_TOPN_DATES_PER_PLATE == 0);
-        ASSERT(bucket_base_orderdate >= plate_base_orderdate);
-        ASSERT(bucket_base_orderdate < plate_base_orderdate + CONFIG_TOPN_DATES_PER_PLATE);
-        ASSERT((bucket_base_orderdate - plate_base_orderdate) % CONFIG_ORDERDATES_PER_BUCKET == 0);
 
         uint32_t& topn_count = g_pretopn_count_start_ptr[plate_id];
         uint64_t* topn_ptr = g_pretopn_start_ptr + (uint64_t)plate_id * CONFIG_EXPECT_MAX_TOPN;
@@ -1460,6 +1457,10 @@ static void worker_compute_pretopn([[maybe_unused]] const uint32_t tid) noexcept
         for (uint32_t bucket_id = plate_base_bucket_id; bucket_id < plate_base_bucket_id + BUCKETS_PER_PLATE; ++bucket_id) {
             if (calc_bucket_mktid(bucket_id) != base_mktid) break;
             TRACE("pretopn for bucket_id: %u", bucket_id);
+            const date_t bucket_base_orderdate = calc_bucket_base_orderdate_by_bucket_id(bucket_id);
+            ASSERT(bucket_base_orderdate >= plate_base_orderdate);
+            ASSERT(bucket_base_orderdate < plate_base_orderdate + CONFIG_TOPN_DATES_PER_PLATE);
+            ASSERT((bucket_base_orderdate - plate_base_orderdate) % CONFIG_ORDERDATES_PER_BUCKET == 0);
 
 #if ENABLE_ASSERTION
             ASSERT(calc_plate_id(bucket_id) == plate_id);

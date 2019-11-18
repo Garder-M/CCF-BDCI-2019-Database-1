@@ -485,6 +485,8 @@ void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
             tmp.total_expend_cent = value >> 36;
             tmp.orderkey = (value >> 6) & ((1U << 30) - 1);
             tmp.orderdate = from_orderdate + (value & 0b111111U);
+            // tmp.orderkey = value & ((1U << 30) - 1);
+            // tmp.orderdate = from_orderdate + ((value >> 30) & 0b111111U);
 
             if (query.result_size < query.q_topn) {
                 query.result[query.result_size++] = tmp;
@@ -792,9 +794,9 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             //     greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
             // }
             // else {  // base_orderdate <= q_shipdate < base_orderdate + 128
-            //     greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);  // TODO: dummy. remove!
+            //     greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);  // TODO: dummy. remove!
             // }
-            greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);
+            greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
             // const uint32_t* const end_align32 = p + __align_down(bucket_size_major / sizeof(uint32_t), 32);
             uint32_t count = 0;
             __m256i items1, items2, items3, items4;
@@ -986,10 +988,10 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             //     greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
             // }
             // else {  // base_orderdate <= q_shipdate < base_orderdate + 128
-            //     greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);  // TODO: dummy. remove!
+            //     greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);  // TODO: dummy. remove!
             // }
             if (type == 1) {
-                greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);
+                greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
             }
             const uint32_t* const end_align32 = p + __align_down(bucket_size_major / sizeof(uint32_t), 32);
             while (p < end_align32) {
