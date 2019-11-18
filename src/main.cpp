@@ -173,7 +173,7 @@ static void do_multi_process() noexcept
             (g_is_creating_index ? fn_unloader_thread_create_index : fn_unloader_thread_use_index)();
         });
         if (!g_is_creating_index) {
-            unloader_thread = std::thread([&]() {
+            pretopn_thread = std::thread([&]() {
 #if ENABLE_PIN_THREAD_TO_CPU
                 pin_thread_to_cpu_core(g_id);
 #endif
