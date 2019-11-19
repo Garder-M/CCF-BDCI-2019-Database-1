@@ -153,6 +153,7 @@ struct query_result_t {
 #define SHMKEY_CUSTKEY_TO_MKTID     ((key_t)0x19491004)
 #define SHMKEY_ORDERKEY_TO_ORDER    ((key_t)0x19491005)
 #define SHMKEY_ORDERKEY_TO_CUSTKEY  ((key_t)0x19491006)
+#define SHMKEY_QUERY_CONTEXT        ((key_t)0x19491007)
 #define SHMKEY_BUFFER_PACKER_BEGIN  ((key_t)0x20191001)
 
 //==============================================================================

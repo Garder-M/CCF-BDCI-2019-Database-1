@@ -295,6 +295,13 @@ public:
         _sem.post();
     }
 
+    __always_inline void reinit() noexcept
+    {
+        _head = 0;
+        _tail = 0;
+        _sem.reinit();
+    }
+
 private:
     T _items[_Capacity];
     process_private_semaphore _sem { 0 };

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.9.0 FATAL_ERROR)
-
+add_compile_options(-g)
 set(CMAKE_CXX_FLAGS_RELEASE "")  # default: -O3 -DNDEBUG
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g")  # default: -O2 -g -DNDEBUG
 set(CMAKE_CUDA_FLAGS_RELEASE "")  # default: -O3 -DNDEBUG

@@ -1466,10 +1466,6 @@ static void worker_compute_pretopn([[maybe_unused]] const uint32_t tid) noexcept
         for (uint32_t bucket_id = plate_base_bucket_id; bucket_id < plate_base_bucket_id + BUCKETS_PER_PLATE; ++bucket_id) {
             if (calc_bucket_mktid(bucket_id) != base_mktid) break;
             TRACE("pretopn for bucket_id: %u", bucket_id);
-            const date_t bucket_base_orderdate = calc_bucket_base_orderdate_by_bucket_id(bucket_id);
-            ASSERT(bucket_base_orderdate >= plate_base_orderdate);
-            ASSERT(bucket_base_orderdate < plate_base_orderdate + CONFIG_TOPN_DATES_PER_PLATE);
-            ASSERT((bucket_base_orderdate - plate_base_orderdate) % CONFIG_ORDERDATES_PER_BUCKET == 0);
 
 #if ENABLE_ASSERTION
             ASSERT(calc_plate_id(bucket_id) == plate_id);
