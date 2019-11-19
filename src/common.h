@@ -194,7 +194,9 @@ public:
 #if ENABLE_LOGGING_DEBUG
         process_shared_mutex parse_query_id_logging_mutex { };
 #endif  // ENABLE_LOGGING_DEBUG
-    } use_index;
+
+        std::atomic_uint32_t worker_query_id_shared_counter { 0 };
+    } use_index { };
 
     process_shared_mutex meta_update_mutex { };
     struct {
@@ -487,7 +489,7 @@ date_t calc_plate_base_orderdate_by_plate_id(const uint32_t plate_id) noexcept
 }
 
 __always_inline
-date_t calc_plate_base_bucket_id_by_plate_id(const uint32_t plate_id) noexcept
+uint32_t calc_plate_base_bucket_id_by_plate_id(const uint32_t plate_id) noexcept
 {
     const uint32_t mktid = plate_id / PLATES_PER_MKTID;
     const uint32_t plate_id_in_mkt = plate_id % PLATES_PER_MKTID;

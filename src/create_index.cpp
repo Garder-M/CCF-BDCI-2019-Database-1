@@ -210,9 +210,11 @@ void fn_loader_thread_create_index([[maybe_unused]] const uint32_t tid) noexcept
         ASSERT(g_orders_shm.ptr != nullptr);
 
 #else
-        uint64_t clear_size = std::min<uint64_t>(
-            g_orders_file.file_size,
-            sizeof(uint32_t) * g_max_orderkey * 6);
+        // TODO: adjust this!
+        const uint64_t clear_size = g_orders_file.file_size;
+//        const uint64_t clear_size = std::min<uint64_t>(
+//            g_orders_file.file_size,
+//            sizeof(uint32_t) * g_max_orderkey * 6);
         //TODO: const uint32_t free_mem = mem_get_free_bytes();
         // Make use of free memory to reduce page cache clearing?
 
@@ -392,7 +394,8 @@ static void worker_load_customer_multi_part([[maybe_unused]] const uint32_t tid)
             }
 
 #if ENABLE_ASSERTION
-            ASSERT(__parse_u32<'|'>(end) % 3 == 1);
+            const uint32_t new_to_custkey = __parse_u32<'|'>(end);
+            ASSERT(new_to_custkey % 3 == 1);
 #endif
         }
 
@@ -911,8 +914,11 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
         vec.iov_len = 0;
     };
 
-
-
+    static constexpr const uint32_t COUNT_BASE = 8;
+    uint32_t last_items[COUNT_BASE + 8];  // start index: COUNT_BASE
+    for (uint32_t i = 0; i < COUNT_BASE; ++i) {
+        last_items[i] = (/*dummy*/0 << 24) | 0x00000000;
+    }
 
     
 #if ENABLE_SHM_CACHE_TXT
@@ -979,8 +985,7 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
 
         TRACE("[%u] load lineitem: [%p, %p)", tid, p, valid_end);
 
-        uint32_t last_items[8];
-        uint32_t last_item_count;
+        uint32_t last_item_count = COUNT_BASE;  // 8 heading zeros
         uint32_t last_orderkey;
         uint32_t last_bucket_id;
         date_t last_orderdate;
@@ -988,10 +993,13 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
 
 
         const auto append_current_order_to_index = [&]() {
-            ASSERT(last_item_count >= 2);
-            ASSERT(last_item_count <= 8);
+            ASSERT(last_item_count >= COUNT_BASE + 1);
+            ASSERT(last_item_count <= COUNT_BASE + 7);
+            last_items[last_item_count++] = (last_orderdate - last_bucket_base_orderdate) << 30 | last_orderkey;
 
-            if (last_item_count == 8) {
+            if (last_item_count >= COUNT_BASE + 5) {  // 8,7,6,5
+                ASSERT(last_item_count <= COUNT_BASE + 8);
+
                 iovec& vec = bucket_data_major[last_bucket_id];
                 ASSERT(vec.iov_len < CONFIG_INDEX_TLS_BUFFER_SIZE_MAJOR);
                 ASSERT(vec.iov_base == _CALC_START_PTR_MAJOR(last_bucket_id));
@@ -999,7 +1007,7 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
 
                 memcpy(
                     (void*)((uintptr_t)vec.iov_base + vec.iov_len),
-                    last_items,
+                    last_items + last_item_count - 8,
                     8 * sizeof(uint32_t));
                 vec.iov_len += 8 * sizeof(uint32_t);
 
@@ -1008,16 +1016,19 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
                     maybe_submit_for_pwrite_major(vec, last_bucket_id);
                 }
             }
-            else {
+            else {  // 4,3,2
+                ASSERT(last_item_count < COUNT_BASE + 5);
+                ASSERT(last_item_count >= COUNT_BASE + 2);
+
                 iovec& vec = bucket_data_minor[last_bucket_id];
                 ASSERT(vec.iov_len <= CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR - CONFIG_INDEX_BUFFER_GRACE_SIZE_MINOR);
                 ASSERT(vec.iov_base == _CALC_START_PTR_MINOR(last_bucket_id));
 
                 memcpy(
                     (void*)((uintptr_t)vec.iov_base + vec.iov_len),
-                    last_items,
-                    last_item_count * sizeof(uint32_t));
-                vec.iov_len += last_item_count * sizeof(uint32_t);
+                    last_items + COUNT_BASE ,
+                    (last_item_count - COUNT_BASE) * sizeof(uint32_t));
+                vec.iov_len += (last_item_count - COUNT_BASE) * sizeof(uint32_t);
 
                 ASSERT(vec.iov_len <= CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR);
                 if (vec.iov_len > CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR - CONFIG_INDEX_BUFFER_GRACE_SIZE_MINOR) {
@@ -1088,8 +1099,8 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
             p += 1;  // skip '\n'
 
             ASSERT(last_orderdate - last_bucket_base_orderdate < CONFIG_ORDERDATES_PER_BUCKET);
-            last_items[0] = ((uint32_t)(shipdate - last_bucket_base_orderdate) << 24) | expend_cent;
-            last_item_count = 1;
+            last_items[COUNT_BASE + 0] = ((uint32_t)(shipdate - last_bucket_base_orderdate) << 24) | expend_cent;
+            last_item_count = COUNT_BASE + 1;
         }
 
 
@@ -1142,15 +1153,12 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
                     max_orderdate_shipdate_diff = shipdate - last_orderdate;
                 }
 
-                ASSERT(last_item_count >= 1);
-                ASSERT(last_item_count < 7);
+                ASSERT(last_item_count >= COUNT_BASE + 1);
+                ASSERT(last_item_count < COUNT_BASE + 7);
                 last_items[last_item_count++] = ((uint32_t)(shipdate - last_bucket_base_orderdate) << 24) | expend_cent;
             }
             else {  // orderkey != last_orderkey
                 // Save current items to index buffer
-                ASSERT(last_item_count >= 1);
-                ASSERT(last_item_count <= 7);
-                last_items[last_item_count++] = (last_orderdate - last_bucket_base_orderdate) << 30 | last_orderkey;
                 append_current_order_to_index();
 
                 ASSERT(orderkey == last_orderkey + 1);
@@ -1182,8 +1190,8 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
                 }
 
                 ASSERT(last_orderdate - last_bucket_base_orderdate < CONFIG_ORDERDATES_PER_BUCKET);
-                last_items[0] = ((uint32_t)(shipdate - last_bucket_base_orderdate) << 24) | expend_cent;
-                last_item_count = 1;
+                last_items[COUNT_BASE + 0] = ((uint32_t)(shipdate - last_bucket_base_orderdate) << 24) | expend_cent;
+                last_item_count = COUNT_BASE + 1;
             }
 
 
@@ -1191,9 +1199,6 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
                 ASSERT(p == valid_end);
 
                 // Save current items to index buffer
-                ASSERT(last_item_count >= 1);
-                ASSERT(last_item_count <= 7);
-                last_items[last_item_count++] = (last_orderdate - last_bucket_base_orderdate) << 30 | last_orderkey;
                 append_current_order_to_index();
 
                 break;
@@ -1298,13 +1303,13 @@ void worker_compute_pretopn_for_plate(
 #define _CHECK_RESULT(N) \
         do { \
             ASSERT(orderkey##N > 0, ""); \
+            ASSERT(orderkey##N < (1U << 30)); \
             ASSERT(orderkey##N <= g_max_orderkey, "orderkey" #N " too large: %u", orderkey##N); \
             ASSERT(total_expend_cent##N > 0, "orderkey" #N ": %u", orderkey##N); \
             ASSERT(total_expend_cent##N < (1U << 28)); \
             ASSERT(plate_orderdate_diff##N >= 0); \
             ASSERT(plate_orderdate_diff##N < (1 << 6)); \
-            /* const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(plate_orderdate_diff##N) << 30 | orderkey##N; */ \
-            const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(orderkey##N) << 6 | plate_orderdate_diff##N; \
+            const uint64_t value = (uint64_t)(total_expend_cent##N) << 36 | (uint64_t)(orderkey##N) << 6 | (plate_orderdate_diff##N); \
             \
             if (topn_count < CONFIG_EXPECT_MAX_TOPN) { \
                 topn_ptr[topn_count++] = value; \
@@ -1469,6 +1474,11 @@ static void worker_compute_pretopn([[maybe_unused]] const uint32_t tid) noexcept
 #if ENABLE_ASSERTION
             ASSERT(calc_plate_id(bucket_id) == plate_id);
 #endif
+
+            const date_t bucket_base_orderdate = calc_bucket_base_orderdate_by_bucket_id(bucket_id);
+            ASSERT(bucket_base_orderdate >= plate_base_orderdate);
+            ASSERT(bucket_base_orderdate < plate_base_orderdate + CONFIG_TOPN_DATES_PER_PLATE);
+            ASSERT((bucket_base_orderdate - plate_base_orderdate) % CONFIG_ORDERDATES_PER_BUCKET == 0);
 
             const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
             ASSERT(holder_id < CONFIG_INDEX_HOLDER_COUNT);
@@ -1727,7 +1737,7 @@ void fn_worker_thread_create_index(const uint32_t tid) noexcept
                 greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
             }
             else {  // base_orderdate <= q_shipdate < base_orderdate + 128
-                greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24);  // TODO: dummy. remove!
+                greater_than_value = _mm256_set1_epi32((q_shipdate - base_orderdate) << 24 | 0x00FFFFFF);  // TODO: dummy. remove!
             }
 
             uint32_t* p = ptr;
