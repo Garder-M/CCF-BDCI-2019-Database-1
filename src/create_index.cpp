@@ -378,18 +378,22 @@ static void worker_load_customer_multi_part([[maybe_unused]] const uint32_t tid)
 
             const uint32_t to_custkey = __parse_u32<'|'>(end);
             if (to_custkey % 3 == 1) {
-                while (*end != '\n') ++end;
-                ++end;  // skip '\n'
-                while (*end != '\n') ++end;
-                ++end;  // skip '\n'
+                // Do nothing
             }
             else if (to_custkey % 3 == 2) {
                 while (*end != '\n') ++end;
                 ++end;  // skip '\n'
+                while (*end != '\n') ++end;
+                ++end;  // skip '\n'
             }
             else {  // to_custkey % 3 == 0
-                // Do nothing
+                while (*end != '\n') ++end;
+                ++end;  // skip '\n'
             }
+
+#if ENABLE_ASSERTION
+            ASSERT(__parse_u32<'|'>(end) % 3 == 1);
+#endif
         }
 
         TRACE("[%u] load customer: [%p, %p)", tid, p, end);
