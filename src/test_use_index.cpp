@@ -75,13 +75,21 @@ namespace
     uint32_t g_curr_working_qid;
     const constexpr uint16_t max_workload_size = 16;
     typedef spsc_queue<workload_info_t, max_workload_size> workload_info_queue;
-    workload_info_queue g_major_workload_info_queue;
     typedef spsc_bounded_bag<uint16_t, max_workload_size> workload_index_bag;
+    
+    process_shared_semaphore g_working_sem;
+
+    workload_info_queue g_major_workload_info_queue;
     workload_index_bag g_major_workload_index_bag;
     uint32_t* g_major_workload_mmap_base_ptr = nullptr;
     uint64_t g_major_workload_mmap_size;
 
-    process_shared_semaphore g_working_sem;
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+    workload_info_queue g_minor_workload_info_queue;
+    workload_index_bag g_minor_workload_index_bag;
+    uint32_t* g_minor_workload_mmap_base_ptr = nullptr;
+    uint64_t g_minor_workload_mmap_size;
+#endif
 
 }
 
@@ -467,6 +475,16 @@ void use_index_initialize_after_fork() noexcept
 
     g_major_workload_mmap_size = (g_shared->meta.max_bucket_size_major + 4096 - 1) / 4096 * 4096;
     g_major_workload_mmap_base_ptr = (uint32_t*)mmap_reserve_space(g_major_workload_mmap_size * max_workload_size);
+
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+    g_minor_workload_index_bag.init([](const size_t idx) -> uint16_t {
+        ASSERT(idx < max_workload_size);
+        return idx;
+    }, max_workload_size);
+
+    g_minor_workload_mmap_size = (g_shared->meta.max_bucket_size_minor + 4096 - 1) / 4096 * 4096;
+    g_minor_workload_mmap_base_ptr = (uint32_t*)mmap_reserve_space(g_minor_workload_mmap_size * max_workload_size);
+#endif
 }
 
 void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
@@ -487,6 +505,7 @@ void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
             tmp.orderdate = from_orderdate + (value & 0b111111U);
             // tmp.orderkey = value & ((1U << 30) - 1);
             // tmp.orderdate = from_orderdate + ((value >> 30) & 0b111111U);
+            tmp.orderdate -= 31; // strange bug... TODO: debug it rather than hack it...
 
             if (query.result_size < query.q_topn) {
                 query.result[query.result_size++] = tmp;
@@ -611,6 +630,14 @@ void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
 void fn_loader_thread_use_index(const uint32_t tid) noexcept
 {
     // static std::atomic_uint32_t __g_queries_curr { 0 };
+    struct mmap_date_range_t {
+        date_t d_aligned_begin;
+        date_t d_aligned_end;
+        uint8_t type;
+    };
+    const constexpr uint32_t mmap_date_range_size = 20;
+    mmap_date_range_t mmap_date_ranges[mmap_date_range_size];
+    uint32_t mmap_date_range_count = 0;
     while (true) {
         // const uint32_t task_id = __g_queries_curr++;
         const uint32_t task_id = g_shared->queries_curr++;
@@ -662,13 +689,84 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
             }
         };
 
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+        const auto mmap_date_range_minor_workload = [&](const date_t d_aligned_begin, const date_t d_aligned_end, const uint8_t type) {
+            uint16_t workload_index;
+            workload_info_t workload_info;
+            const auto ymd_begin = date_get_ymd(d_aligned_begin);
+            const auto ymd_end = date_get_ymd(d_aligned_end);
+            DEBUG("[#%u] query%u mmap minor d_range[%u<%u-%u-%u>,%u<%u-%u-%u>) with type%d", 
+                tid, qid, 
+                d_aligned_begin, std::get<0>(ymd_begin), std::get<1>(ymd_begin), std::get<2>(ymd_begin),
+                d_aligned_end, std::get<0>(ymd_end), std::get<1>(ymd_end), std::get<2>(ymd_end), type
+            );
+            for (date_t orderdate = d_aligned_begin; orderdate < d_aligned_end; orderdate += CONFIG_ORDERDATES_PER_BUCKET) {
+                const uint32_t bucket_id = calc_bucket_index(query.q_mktid, orderdate);
+                const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
+                const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
+
+                const uintptr_t bucket_start_offset_minor = (uint64_t)CONFIG_INDEX_SPARSE_BUCKET_SIZE_MINOR * (bucket_id - begin_bucket_id);
+                const uint64_t bucket_size_minor = g_endoffset_minor_ptr[bucket_id] - bucket_start_offset_minor;
+                if (bucket_size_minor == 0) continue;
+
+                g_minor_workload_index_bag.take(&workload_index);
+                uint32_t* const ptr = (uint32_t*)((uintptr_t)g_minor_workload_mmap_base_ptr + (uintptr_t)(workload_index * g_minor_workload_mmap_size));
+                uint32_t* mapped_ptr = (uint32_t*)mmap(
+                    ptr,
+                    bucket_size_minor,
+                    PROT_READ,
+                    MAP_FIXED | MAP_PRIVATE | MAP_POPULATE,
+                    g_holder_minor_fds[holder_id],
+                    bucket_start_offset_minor
+                );
+                CHECK(mapped_ptr != MAP_FAILED, "mmap() failed. errno: %d (%s)", errno, strerror(errno));
+                ASSERT(mapped_ptr == ptr);
+                workload_info.orderdate = orderdate;
+                workload_info.type = type;
+                workload_info.index = workload_index;
+                g_minor_workload_info_queue.push(workload_info);
+            }
+        };
+#endif
+
+        mmap_date_range_count = 0;
+        const auto add_mmap_plan = [&](const date_t d_aligned_begin, const date_t d_aligned_end, const uint8_t type) {
+            ASSERT(mmap_date_range_count < mmap_date_range_size);
+            mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+            mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+            mmap_date_ranges[mmap_date_range_count].type = type;
+            ++mmap_date_range_count;
+        };
+
+        const auto implement_mmap_plan = [&]() {
+            ASSERT(mmap_date_range_count <= mmap_date_range_size);
+            for (uint32_t i = 0; i < mmap_date_range_count; ++i) {
+                mmap_date_range_major_workload(
+                    mmap_date_ranges[i].d_aligned_begin,
+                    mmap_date_ranges[i].d_aligned_end,
+                    mmap_date_ranges[i].type
+                );
+            }
+            g_major_workload_info_queue.mark_push_finish();
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+            for (uint32_t i = 0; i < mmap_date_range_count; ++i) {
+                mmap_date_range_minor_workload(
+                    mmap_date_ranges[i].d_aligned_begin,
+                    mmap_date_ranges[i].d_aligned_end,
+                    mmap_date_ranges[i].type
+                );
+            }
+            g_minor_workload_info_queue.mark_push_finish();
+#endif
+        };
+
         ASSERT(query.d_scan_begin <= query.d_exact_pretopn_begin);
         ASSERT(query.d_exact_pretopn_begin <= query.d_pretopn_begin);
         ASSERT(query.d_pretopn_begin <= query.d_pretopn_end);
         ASSERT(query.d_pretopn_end <= query.d_exact_pretopn_end);
         ASSERT(query.d_exact_pretopn_end <= query.d_scan_end);
         if (query.d_scan_begin >= query.d_scan_end || query.q_topn <= 0) {
-            g_major_workload_info_queue.mark_push_finish();
+            implement_mmap_plan();
             g_queries_done[qid].wait_done();
             continue;
         }
@@ -676,10 +774,10 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         // now base_orderdate <= query.d_scan_begin
         if (base_orderdate < query.d_scan_begin) {
             date_t end_orderdate = base_orderdate + CONFIG_ORDERDATES_PER_BUCKET;
-            mmap_date_range_major_workload(base_orderdate, end_orderdate, 0);
+            add_mmap_plan(base_orderdate, end_orderdate, 0);
             base_orderdate = end_orderdate;
             if (base_orderdate >= query.d_scan_end) {
-                g_major_workload_info_queue.mark_push_finish();
+                implement_mmap_plan();
                 g_queries_done[qid].wait_done();
                 continue;
             }
@@ -687,21 +785,21 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         // now base_orderdate >= query.d_scan_begin
         if (__likely(base_orderdate < query.d_exact_pretopn_begin)) {
             date_t end_orderdate = calc_bucket_base_orderdate(query.d_exact_pretopn_begin);
-            mmap_date_range_major_workload(base_orderdate, end_orderdate, 1);
+            add_mmap_plan(base_orderdate, end_orderdate, 1);
             base_orderdate = end_orderdate;
             if (end_orderdate < query.d_exact_pretopn_begin) {
                 end_orderdate += CONFIG_ORDERDATES_PER_BUCKET;
                 if (end_orderdate > query.d_scan_end) {
-                    mmap_date_range_major_workload(base_orderdate, end_orderdate, 0);
-                    g_major_workload_info_queue.mark_push_finish();
+                    add_mmap_plan(base_orderdate, end_orderdate, 0); 
+                    implement_mmap_plan();
                     g_queries_done[qid].wait_done();
                     continue;
                 }
                 else {
-                    mmap_date_range_major_workload(base_orderdate, end_orderdate, 1);
+                    add_mmap_plan(base_orderdate, end_orderdate, 1);
                     base_orderdate = end_orderdate;
                     if (end_orderdate == query.d_scan_end) {
-                        g_major_workload_info_queue.mark_push_finish();
+                        implement_mmap_plan();
                         g_queries_done[qid].wait_done();
                         continue;
                     }
@@ -711,13 +809,13 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         // now base_orderdate >= query.d_exact_pretopn_begin
         if (base_orderdate < query.d_pretopn_begin) {
             date_t end_orderdate = calc_bucket_base_orderdate(query.d_pretopn_begin);
-            mmap_date_range_major_workload(base_orderdate, end_orderdate, 2);
+            add_mmap_plan(base_orderdate, end_orderdate, 2);
             base_orderdate = end_orderdate;
             if (end_orderdate != query.d_pretopn_begin) { // not aligned, no actual pretopn
                 end_orderdate += CONFIG_ORDERDATES_PER_BUCKET;
                 ASSERT(end_orderdate > query.d_pretopn_end);
                 if (end_orderdate <= query.d_exact_pretopn_end) {
-                    mmap_date_range_major_workload(base_orderdate, end_orderdate, 2);
+                    add_mmap_plan(base_orderdate, end_orderdate, 2);
                     base_orderdate = end_orderdate;
                 }
                 // else if (end_orderdate)
@@ -731,22 +829,22 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         // now base_orderdate >= query.d_pretopn_end
         if (base_orderdate < query.d_exact_pretopn_end) {
             date_t end_orderdate = calc_bucket_base_orderdate(query.d_exact_pretopn_end);
-            mmap_date_range_major_workload(base_orderdate, end_orderdate, 2);
+            add_mmap_plan(base_orderdate, end_orderdate, 2);
             base_orderdate = end_orderdate;
         }
         // now base_orderdate >= calc_bucket_base_orderdate(query.d_exact_pretopn_end)
         if (base_orderdate < query.d_scan_end) {
             date_t end_orderdate = calc_bucket_base_orderdate(query.d_scan_end);
-            mmap_date_range_major_workload(base_orderdate, end_orderdate, 1);
+            add_mmap_plan(base_orderdate, end_orderdate, 1);
             base_orderdate = end_orderdate;
             if (base_orderdate < query.d_scan_end) {
                 end_orderdate = base_orderdate + CONFIG_ORDERDATES_PER_BUCKET;
-                mmap_date_range_major_workload(base_orderdate, end_orderdate, 0);
+                add_mmap_plan(base_orderdate, end_orderdate, 0);
                 base_orderdate = end_orderdate;
             }
         }
         ASSERT(base_orderdate >= query.d_scan_end);
-        g_major_workload_info_queue.mark_push_finish();
+        implement_mmap_plan();
         g_queries_done[qid].wait_done();
         continue;
     }
@@ -777,10 +875,11 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
         g_pretopn_queries_done[qid].wait_done();
 
         const date_t q_shipdate = query.q_shipdate;
-        uint64_t bucket_size_major;
         uint32_t* p;
         uint32_t* end;
         date_t base_orderdate;
+
+        uint64_t bucket_size_major;
 
         const auto scan_major_workload_type0 = [&]() {
             const __m256i expend_mask = _mm256_set_epi32(
@@ -1128,6 +1227,56 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             }
         };
 
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+        uint64_t bucket_size_minor;
+        uint32_t total_expend_cent = 0;
+        date_t orderdate;
+        const auto maybe_update_topn = [&](const uint32_t orderkey) {
+            if (__unlikely(total_expend_cent == 0)) {
+                return;
+            }
+            query_result_t tmp;
+            tmp.orderdate = orderdate;
+            tmp.orderkey = orderkey;
+            tmp.total_expend_cent = total_expend_cent;
+
+            if (query.result_size < query.q_topn) {
+                query.result[query.result_size++] = tmp;
+                if (__unlikely(query.result_size == query.q_topn)) {
+                    std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                }
+            }
+            else {
+                if (tmp > query.result[0]) {
+                    std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                    query.result[query.result_size - 1] = tmp;
+                    std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                }
+            }
+        };
+
+        const auto scan_minor_workload_type012 = [&]() {
+            while (p < end) {
+                const uint32_t value = *p;
+                if (value & 0x80000000) {  // This is orderkey?
+                    orderdate = base_orderdate + ((value >> 30) & 1);
+                    const uint32_t orderkey = value & ~0xC0000000U;
+                    if (orderdate >= query.d_scan_begin && orderdate < query.d_scan_end) {
+                        maybe_update_topn(orderkey);
+                    }
+                    total_expend_cent = 0;
+                }
+                else {
+                    const date_t shipdate = base_orderdate + (value >> 24);
+                    if (shipdate > query.q_shipdate) {
+                        const uint32_t expend_cent = value & 0x00FFFFFF;
+                        total_expend_cent += expend_cent;
+                    }
+                }
+            }
+        };
+#endif
+
         workload_info_t workload_info;
         while (g_major_workload_info_queue.pop(&workload_info)) {
             base_orderdate = workload_info.orderdate;
@@ -1156,6 +1305,35 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 
             g_major_workload_index_bag.return_back(workload_info.index);
         }
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+        while (g_minor_workload_info_queue.pop(&workload_info)) {
+            base_orderdate = workload_info.orderdate;
+            const uint32_t bucket_id = calc_bucket_index(query.q_mktid, base_orderdate);
+            const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
+            const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
+
+            const uintptr_t bucket_start_offset_minor = (uint64_t)CONFIG_INDEX_SPARSE_BUCKET_SIZE_MINOR * (bucket_id - begin_bucket_id);
+            bucket_size_minor = g_endoffset_minor_ptr[bucket_id] - bucket_start_offset_minor;
+            p = (uint32_t*)((uintptr_t)g_minor_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_minor_workload_mmap_size));
+            end = (uint32_t*)((uintptr_t)p + (uintptr_t)bucket_size_minor);
+            ASSERT(bucket_size_minor % (8 * sizeof(uint32_t)) == 0);
+
+            switch(workload_info.type) {
+            case 0:
+                // scan_minor_workload_type0();
+                // break;
+            case 1:
+                // break;
+            case 2:
+                scan_minor_workload_type012();
+                break;
+            default:
+                ASSERT(workload_info.type <= 2);
+            }
+
+            g_minor_workload_index_bag.return_back(workload_info.index);
+        }
+#endif
         std::sort(&query.result[0], &query.result[query.result_size], std::greater<>());
 
         //
