@@ -23,8 +23,6 @@ struct query_t
     uint32_t result_size;
     char* output = nullptr;
     uint32_t output_size;
-    // uint32_t* item_buffer = nullptr;
-    // uint32_t* item_size_buffer = nullptr;
 };
 
 struct date_range_t
@@ -52,6 +50,7 @@ namespace
 
     uint64_t* g_pretopn_ptr = nullptr;
     uint32_t* g_pretopn_count_ptr = nullptr;
+    uint32_t* g_minor_pretop1_expend_ptr = nullptr;
     uint32_t* g_shared_pretopn_q_index_buffer = nullptr;
     int* g_holder_major_fds = nullptr;
     int* g_holder_minor_fds = nullptr;
@@ -383,11 +382,15 @@ void use_index_initialize_before_fork() noexcept
     // Load pretopn and pretopn_count
     //
     {
-        load_file_context pretopn_ctx, pretopn_count_ctx;
+        load_file_context pretopn_ctx, pretopn_count_ctx, minor_pretop1_expend_ctx;
         __openat_file_read(g_index_directory_fd, "pretopn", &pretopn_ctx);
         __openat_file_read(g_index_directory_fd, "pretopn_count", &pretopn_count_ctx);
+        __openat_file_read(g_index_directory_fd, "only_minor_max_expend", &minor_pretop1_expend_ctx);
 
-        // ASSERT(pretopn_size == sizeof(uint64_t) * CONFIG_EXPECT_MAX_TOPN * g_shared->mktid_count * PLATES_PER_MKTID);
+        ASSERT(pretopn_ctx.file_size == sizeof(uint64_t) * CONFIG_EXPECT_MAX_TOPN * g_shared->total_plates);
+        ASSERT(pretopn_count_ctx.file_size == sizeof(uint32_t) * g_shared->total_plates);
+        ASSERT(minor_pretop1_expend_ctx.file_size == sizeof(uint32_t) * g_shared->total_buckets);
+
         uint64_t* reserve_g_pretopn_ptr = (uint64_t*)mmap_reserve_space(pretopn_ctx.file_size);
         g_pretopn_ptr = (uint64_t*)mmap(
             reserve_g_pretopn_ptr,
@@ -399,17 +402,27 @@ void use_index_initialize_before_fork() noexcept
         ASSERT(reserve_g_pretopn_ptr == g_pretopn_ptr);
         INFO("g_pretopn_ptr: %p", g_pretopn_ptr);
 
-        // ASSERT(pretopn_count_size == sizeof(uint32_t) * g_shared->mktid_count * PLATES_PER_MKTID);
-        uint32_t* reserve_g_pretopn_count_ptr = (uint32_t*)mmap_reserve_space(pretopn_ctx.file_size);
+        uint32_t* reserve_g_pretopn_count_ptr = (uint32_t*)mmap_reserve_space(pretopn_count_ctx.file_size);
         g_pretopn_count_ptr = (uint32_t*)mmap(
             reserve_g_pretopn_count_ptr,
-            pretopn_ctx.file_size,
+            pretopn_count_ctx.file_size,
             PROT_READ,
             MAP_PRIVATE | MAP_POPULATE | MAP_FIXED,
-            pretopn_ctx.fd,
+            pretopn_count_ctx.fd,
             0);
         ASSERT(reserve_g_pretopn_count_ptr == g_pretopn_count_ptr);
         INFO("g_pretopn_count_ptr: %p", g_pretopn_count_ptr);
+
+        uint32_t* reserve_g_minor_pretop1_expend_ptr = (uint32_t*)mmap_reserve_space(minor_pretop1_expend_ctx.file_size);
+        g_minor_pretop1_expend_ptr = (uint32_t*)mmap(
+            reserve_g_minor_pretop1_expend_ptr,
+            minor_pretop1_expend_ctx.file_size,
+            PROT_READ,
+            MAP_PRIVATE | MAP_POPULATE | MAP_FIXED,
+            minor_pretop1_expend_ctx.fd,
+            0);
+        ASSERT(reserve_g_minor_pretop1_expend_ptr == g_minor_pretop1_expend_ptr);
+        INFO("g_minor_pretop1_expend_ptr: %p", g_minor_pretop1_expend_ptr);
     }
 
     //
@@ -1614,6 +1627,21 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             );
             const date_t base_orderdate = workload_info.orderdate;
             const uint32_t bucket_id = calc_bucket_index(query.q_mktid, base_orderdate);
+            
+            if (__likely(query.result_size >= query.q_topn)) {
+                const uint32_t bucket_minor_pretop1_expend = g_minor_pretop1_expend_ptr[bucket_id];
+                const uint32_t q_min_expend = query.result[0].total_expend_cent;
+                if (__likely(bucket_minor_pretop1_expend < q_min_expend)) {
+                    g_minor_workload_index_bag.return_back(workload_info.index);
+                    TRACE("[#%u] query%u returned back %uth(g%u) mmap workload to minor_bag",
+                        tid, qid,
+                        minor_workload_count, global_minor_workload_count
+                    );
+                    ++minor_workload_count;
+                    ++global_minor_workload_count;
+                    continue;
+                }
+            }
             const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
             const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
 
@@ -1686,53 +1714,6 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
         );
 #endif
         std::sort(&query.result[0], &query.result[query.result_size], std::greater<>());
-
-        // //
-        // // print query to string
-        // //
-        // std::string output;
-        // const auto append_u32 = [&](const uint32_t n) noexcept {
-        //     ASSERT(n > 0);
-        //     output += std::to_string(n);  // TODO: implement it!
-        // };
-        // const auto append_u32_width2 = [&](const uint32_t n) noexcept {
-        //     ASSERT(n <= 99);
-        //     output += (char)('0' + n / 10);
-        //     output += (char)('0' + n % 10);
-        // };
-        // const auto append_u32_width4 = [&](const uint32_t n) noexcept {
-        //     ASSERT(n <= 9999);
-        //     output += (char)('0' + (n       ) / 1000);
-        //     output += (char)('0' + (n % 1000) / 100);
-        //     output += (char)('0' + (n % 100 ) / 10);
-        //     output += (char)('0' + (n % 10 )  / 1);
-        // };
-        // output.reserve((size_t)(query.q_topn + 1) * 40);  // max line length: ~32, reserved to 40
-        // output += "l_orderkey|o_orderdate|revenue\n";
-        // for (uint32_t i = 0; i < query.result_size; ++i) {
-        //     //printf("%u|%u-%02u-%02u|%u.%02u\n",
-        //     //       line.orderkey,
-        //     //       std::get<0>(ymd), std::get<1>(ymd), std::get<2>(ymd),
-        //     //       line.total_expend_cent / 100, line.total_expend_cent % 100);
-        //     const query_result_t& line = query.result[i];
-        //     const auto ymd = date_get_ymd(line.orderdate);
-        //     append_u32(((line.orderkey & ~0b111) << 2) | (line.orderkey & 0b111));
-        //     output += '|';
-        //     append_u32_width4(std::get<0>(ymd));
-        //     output += '-';
-        //     append_u32_width2(std::get<1>(ymd));
-        //     output += '-';
-        //     append_u32_width2(std::get<2>(ymd));
-        //     output += '|';
-        //     append_u32(line.total_expend_cent / 100);
-        //     output += '.';
-        //     append_u32_width2(line.total_expend_cent % 100);
-        //     output += '\n';
-        // }
-        
-        // query.output_size = output.size();
-        // CHECK(query.output_size <= (query.q_topn + 1) * 40);
-        // memcpy(query.output, output.c_str(), query.output_size);
 
         //
         // print query to string
