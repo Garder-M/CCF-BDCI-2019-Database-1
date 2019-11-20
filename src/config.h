@@ -81,13 +81,12 @@ static_assert(CONFIG_ORDERDATES_PER_BUCKET <= 4);
 
 // How large is a single buffer for each bucket? How many buffer for all workers do we need?
 // These buffers will be flushed to index file once they are full
-// This is the size for (last_item_count == 8)
-#define CONFIG_INDEX_SPARSE_BUCKET_SIZE_MAJOR   (CONFIG_ORDERDATES_PER_BUCKET * 1048576U * 10)  // Tune factor as necessary
-#define CONFIG_INDEX_TLS_BUFFER_SIZE_MAJOR      (4096U * std::min<uint32_t>(CONFIG_ORDERDATES_PER_BUCKET, 4U))  // Tune factor as necessary
-// This is the size for (last_item_count < 8)
-#define CONFIG_INDEX_SPARSE_BUCKET_SIZE_MINOR   (CONFIG_ORDERDATES_PER_BUCKET * 1048576U * 30)  // Tune factor as necessary
-#define CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR      (4096U * 3 * std::min<uint32_t>(CONFIG_ORDERDATES_PER_BUCKET, 4U))  // Tune factor as necessary
-#define CONFIG_INDEX_BUFFER_GRACE_SIZE_MINOR    (48)
+// This is the size for (item_count == 4,5,6,7)
+#define CONFIG_INDEX_SPARSE_BUCKET_SIZE_MAJOR   (CONFIG_ORDERDATES_PER_BUCKET * 1048576U * 30)  // Tune factor as necessary
+#define CONFIG_INDEX_TLS_BUFFER_SIZE_MAJOR      (4096U * 3 * std::min<uint32_t>(CONFIG_ORDERDATES_PER_BUCKET, 4U))  // Tune factor as necessary
+// This is the size for (item_count == 1,2,3)
+#define CONFIG_INDEX_SPARSE_BUCKET_SIZE_MINOR   (CONFIG_ORDERDATES_PER_BUCKET * 1048576U * 10)  // Tune factor as necessary
+#define CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR      (4096U * std::min<uint32_t>(CONFIG_ORDERDATES_PER_BUCKET, 4U))  // Tune factor as necessary
 
 
 // Number of maximum pretopn limit

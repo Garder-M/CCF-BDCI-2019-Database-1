@@ -1021,17 +1021,18 @@ void worker_load_lineitem_multi_part(const uint32_t tid) noexcept
                 ASSERT(last_item_count >= COUNT_BASE + 2);
 
                 iovec& vec = bucket_data_minor[last_bucket_id];
-                ASSERT(vec.iov_len <= CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR - CONFIG_INDEX_BUFFER_GRACE_SIZE_MINOR);
+                ASSERT(vec.iov_len <= CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR);
                 ASSERT(vec.iov_base == _CALC_START_PTR_MINOR(last_bucket_id));
+                static_assert(CONFIG_INDEX_TLS_BUFFER_SIZE_MAJOR % (4 * sizeof(uint32_t)) == 0);
 
                 memcpy(
                     (void*)((uintptr_t)vec.iov_base + vec.iov_len),
-                    last_items + COUNT_BASE ,
-                    (last_item_count - COUNT_BASE) * sizeof(uint32_t));
-                vec.iov_len += (last_item_count - COUNT_BASE) * sizeof(uint32_t);
+                    last_items + last_item_count - 4,
+                    4 * sizeof(uint32_t));
+                vec.iov_len += 4 * sizeof(uint32_t);
 
                 ASSERT(vec.iov_len <= CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR);
-                if (vec.iov_len > CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR - CONFIG_INDEX_BUFFER_GRACE_SIZE_MINOR) {
+                if (vec.iov_len == CONFIG_INDEX_TLS_BUFFER_SIZE_MINOR) {
                     maybe_submit_for_pwrite_minor(vec, last_bucket_id);
                 }
             }
