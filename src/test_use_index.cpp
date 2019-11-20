@@ -651,9 +651,12 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         date_t d_aligned_end;
         uint8_t type;
     };
-    const constexpr uint32_t mmap_date_range_size = 20;
+    const constexpr uint32_t mmap_date_range_size = 40;
     mmap_date_range_t mmap_date_ranges[mmap_date_range_size];
     uint32_t global_major_workload_count = 0;
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+    uint32_t global_minor_workload_count = 0;
+#endif
     while (true) {
         // const uint32_t task_id = __g_queries_curr++;
         const uint32_t task_id = g_shared->queries_curr++;
@@ -664,11 +667,8 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         }
         const uint32_t qid = g_tasks_to_query[task_id];
         g_curr_working_qid = qid;
-        size_t queue_head, queue_tail;
-        // g_major_workload_info_queue.report(&queue_head, &queue_tail);
-        DEBUG("[#%u] query%u fetched, major_queue init status head=%llu, tail=%llu", 
-                tid, qid, 
-                queue_head, queue_tail
+        DEBUG("[#%u] query%u fetched", 
+                tid, qid
         );
         g_major_workload_info_queue.reinit();
 #if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
@@ -729,13 +729,14 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
         };
 
 #if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+        uint32_t minor_workload_count = 0;
         const auto mmap_date_range_minor_workload = [&](const date_t d_aligned_begin, const date_t d_aligned_end, const uint8_t type) {
             uint16_t workload_index;
             workload_info_t workload_info;
             const auto ymd_begin = date_get_ymd(d_aligned_begin);
             const auto valid_d_aligned_end = std::min<date_t>(d_aligned_end, MAX_TABLE_DATE);
             const auto ymd_end = date_get_ymd(valid_d_aligned_end);
-            TRACE("[#%u] query%u mmap minor d_range[%u<%u-%u-%u>,%u<%u-%u-%u>) with type%d", 
+            DEBUG("[#%u] query%u mmap minor d_range[%u<%u-%u-%u>,%u<%u-%u-%u>) with type%d", 
                 tid, qid, 
                 d_aligned_begin, std::get<0>(ymd_begin), std::get<1>(ymd_begin), std::get<2>(ymd_begin),
                 valid_d_aligned_end, std::get<0>(ymd_end), std::get<1>(ymd_end), std::get<2>(ymd_end), type
@@ -749,6 +750,10 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
                 const uint64_t bucket_size_minor = g_endoffset_minor_ptr[bucket_id] - bucket_start_offset_minor;
                 if (bucket_size_minor == 0) continue;
 
+                TRACE("[#%u] query%u want to take %uth(g%u) mmap workload from minor_bag",
+                    tid, qid,
+                    minor_workload_count, global_minor_workload_count
+                );
                 g_minor_workload_index_bag.take(&workload_index);
                 uint32_t* const ptr = (uint32_t*)((uintptr_t)g_minor_workload_mmap_base_ptr + (uintptr_t)(workload_index * g_minor_workload_mmap_size));
                 uint32_t* mapped_ptr = (uint32_t*)mmap(
@@ -765,20 +770,89 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
                 workload_info.type = type;
                 workload_info.index = workload_index;
                 g_minor_workload_info_queue.push(workload_info);
+                TRACE("[#%u] query%u pushed %uth(g%u) mmap workload to minor_queue, <%u,%u,%u>",
+                    tid, qid,
+                    minor_workload_count, global_minor_workload_count,
+                    workload_info.orderdate, workload_info.type, workload_info.index
+                );
+                ++minor_workload_count;
+                ++global_minor_workload_count;
             }
         };
 #endif
 
         uint32_t mmap_date_range_count = 0;
-        const auto add_mmap_plan = [&](const date_t d_aligned_begin, const date_t d_aligned_end, const uint8_t type) {
+        const auto add_mmap_plan = [&](const date_t d_aligned_begin, const date_t d_aligned_end, const uint8_t original_type) {
             ASSERT(mmap_date_range_count < mmap_date_range_size);
             if (d_aligned_end <= d_aligned_begin) return;
-            mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
-            mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
-            mmap_date_ranges[mmap_date_range_count].type = type;
-            ++mmap_date_range_count;
-            DEBUG("[#%u] query%u add mmap range [%u,%u) with type%u", 
-                tid, qid, d_aligned_begin, d_aligned_end, type);
+            uint32_t ori_mmap_date_range_count = mmap_date_range_count;
+            if (original_type == 0) {
+                if (d_aligned_begin > query.q_shipdate) {
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 1;
+                    ++mmap_date_range_count;
+                }
+                else if (d_aligned_end - CONFIG_ORDERDATES_PER_BUCKET <= query.q_shipdate) {
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 0;
+                    ++mmap_date_range_count;
+                }
+                else {
+                    date_t d_aligned_middle;
+                    for (d_aligned_middle = d_aligned_begin; d_aligned_middle <= query.q_shipdate; d_aligned_middle += CONFIG_ORDERDATES_PER_BUCKET);
+                    ASSERT(d_aligned_middle < d_aligned_end);
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_middle;
+                    mmap_date_ranges[mmap_date_range_count].type = 0;
+                    ++mmap_date_range_count;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_middle;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 1;
+                    ++mmap_date_range_count;
+                }
+            }
+            else if (original_type == 1) {
+                if (d_aligned_begin > query.q_shipdate) {
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 3;
+                    ++mmap_date_range_count;
+                }
+                else if (d_aligned_end - CONFIG_ORDERDATES_PER_BUCKET <= query.q_shipdate) {
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 2;
+                    ++mmap_date_range_count;
+                }
+                else {
+                    date_t d_aligned_middle;
+                    for (d_aligned_middle = d_aligned_begin; d_aligned_middle <= query.q_shipdate; d_aligned_middle += CONFIG_ORDERDATES_PER_BUCKET);
+                    ASSERT(d_aligned_middle < d_aligned_end);
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_middle;
+                    mmap_date_ranges[mmap_date_range_count].type = 2;
+                    ++mmap_date_range_count;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_middle;
+                    mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                    mmap_date_ranges[mmap_date_range_count].type = 3;
+                    ++mmap_date_range_count;
+                }
+            }
+            else if (original_type == 2) {
+                mmap_date_ranges[mmap_date_range_count].d_aligned_begin = d_aligned_begin;
+                mmap_date_ranges[mmap_date_range_count].d_aligned_end = d_aligned_end;
+                mmap_date_ranges[mmap_date_range_count].type = 3;
+                ++mmap_date_range_count;
+            }
+            for (uint32_t i = ori_mmap_date_range_count; i < mmap_date_range_count; ++i) {
+                DEBUG("[#%u] query%u add mmap range [%u,%u) with type%u", 
+                    tid, qid,
+                    mmap_date_ranges[i].d_aligned_begin, mmap_date_ranges[i].d_aligned_end, mmap_date_ranges[i].type
+                );
+
+            }
         };
 
         const auto implement_mmap_plan = [&]() {
@@ -930,9 +1004,518 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
 
 }
 
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+template<bool _CheckShipdateDiff>
+void scan_minor_index_nocheck_orderdate_maybe_check_shipdate(
+    /*in*/ const uint32_t* const bucket_ptr,
+    /*in*/ const uint64_t bucket_size,
+    /*in*/ const date_t bucket_base_orderdate,
+    /*inout*/ query_result_t* const results,
+    /*inout*/ uint32_t& result_length,
+    /*in*/ const uint32_t q_topn,
+    /*in,opt*/ [[maybe_unused]] const date_t q_shipdate) noexcept
+{
+    [[maybe_unused]] __m256i curr_min_expend_cent;
+    if (__likely(result_length > 0)) {
+        curr_min_expend_cent = _mm256_set1_epi32(results[0].total_expend_cent);
+    }
+    else {
+        curr_min_expend_cent = _mm256_setzero_si256();
+    }
+
+
+    const __m256i expend_mask = _mm256_set_epi32(
+        0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+        0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
+
+    [[maybe_unused]] __m256i greater_than_value;
+    [[maybe_unused]] const uint32_t greater_than_value_i32 = (q_shipdate - bucket_base_orderdate) << 24 | 0x00FFFFFF;
+    if constexpr (_CheckShipdateDiff) {
+        // shipdate = bucket_base_orderdate + diff
+        // We want  shipdate > q_shipdate
+        //  <==>    bucket_base_orderdate + diff > q_shipdate
+        //  <==>    diff > q_shipdate - bucket_base_orderdate
+        ASSERT((q_shipdate - bucket_base_orderdate) < (1 << 8));
+        greater_than_value = _mm256_set1_epi32(greater_than_value_i32);
+    }
+
+    ASSERT(bucket_size % (4 * sizeof(uint32_t)) == 0);
+    const uint32_t* p = bucket_ptr;
+    const uint32_t* const end = (uint32_t*)((uintptr_t)bucket_ptr + bucket_size);
+    const uint32_t* const end_align32 = p + __align_down(bucket_size / sizeof(uint32_t), 32);
+    while (p < end_align32) {
+        // Do a quick check!
+        __m256i items12 = _mm256_load_si256((__m256i*)p);
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask12 = _mm256_cmpgt_epi32(items12, greater_than_value);
+            items12 = _mm256_and_si256(items12, gt_mask12);
+        }
+        items12 = _mm256_and_si256(items12, expend_mask);
+
+        __m256i items34 = _mm256_load_si256((__m256i*)p + 1);
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask34 = _mm256_cmpgt_epi32(items34, greater_than_value);
+            items34 = _mm256_and_si256(items34, gt_mask34);
+        }
+        items34 = _mm256_and_si256(items34, expend_mask);
+        
+        __m256i items56 = _mm256_load_si256((__m256i*)p + 2);
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask56 = _mm256_cmpgt_epi32(items56, greater_than_value);
+            items56 = _mm256_and_si256(items56, gt_mask56);
+        }
+        items56 = _mm256_and_si256(items56, expend_mask);
+        
+        __m256i items78 = _mm256_load_si256((__m256i*)p + 3);
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask78 = _mm256_cmpgt_epi32(items78, greater_than_value);
+            items78 = _mm256_and_si256(items78, gt_mask78);
+        }
+        items78 = _mm256_and_si256(items78, expend_mask);
+
+        const __m256i sum = _mm256_hadd_epi32(
+            _mm256_hadd_epi32(items12, items34),
+            _mm256_hadd_epi32(items56, items78));
+
+        const __m256i curr_min_gt_sum = _mm256_cmpgt_epi32(curr_min_expend_cent, sum);
+        if (__likely(_mm256_movemask_epi8(curr_min_gt_sum) == (int)0xFFFFFFFF)) {
+            p += 32;
+            continue;
+        }
+
+        //
+        // NOTE:
+        // minor-order to sum:
+        //  1       2       3       4       5       6       7       8
+        //  |       |       |       |       |       |       |       |
+        //  0       4       1       5       2       6       3       7
+        //
+        const uint32_t total_expend_cent1 = _mm256_extract_epi32(sum, 0);
+        const uint32_t total_expend_cent2 = _mm256_extract_epi32(sum, 4);
+        const uint32_t total_expend_cent3 = _mm256_extract_epi32(sum, 1);
+        const uint32_t total_expend_cent4 = _mm256_extract_epi32(sum, 5);
+        const uint32_t total_expend_cent5 = _mm256_extract_epi32(sum, 2);
+        const uint32_t total_expend_cent6 = _mm256_extract_epi32(sum, 6);
+        const uint32_t total_expend_cent7 = _mm256_extract_epi32(sum, 3);
+        const uint32_t total_expend_cent8 = _mm256_extract_epi32(sum, 7);
+
+#define _DECLARE_ONE_ORDER(N) \
+            const uint32_t orderdate_diff##N = *(p + 3) >> 30; \
+            const date_t orderdate##N = bucket_base_orderdate + orderdate_diff##N; \
+            const uint32_t orderkey##N = *(p + 3) & ~0xC0000000U; \
+            p += 4;
+
+        _DECLARE_ONE_ORDER(1)
+        _DECLARE_ONE_ORDER(2)
+        _DECLARE_ONE_ORDER(3)
+        _DECLARE_ONE_ORDER(4)
+        _DECLARE_ONE_ORDER(5)
+        _DECLARE_ONE_ORDER(6)
+        _DECLARE_ONE_ORDER(7)
+        _DECLARE_ONE_ORDER(8)
+#undef _DECLARE_ONE_ORDER
+
+
+#define _CHECK_RESULT(N) \
+            if (total_expend_cent##N > 0) { \
+                query_result_t tmp; \
+                tmp.orderdate = orderdate##N; \
+                tmp.orderkey = orderkey##N; \
+                tmp.total_expend_cent = total_expend_cent##N; \
+                \
+                if (result_length < q_topn) { \
+                    results[result_length++] = tmp; \
+                    if (__unlikely(result_length == q_topn)) { \
+                        std::make_heap(results, results + result_length, std::greater<>()); \
+                    } \
+                } \
+                else { \
+                    ASSERT(result_length > 0); \
+                    ASSERT(result_length == q_topn); \
+                    if (tmp > results[0]) { \
+                        std::pop_heap(results, results + result_length, std::greater<>()); \
+                        results[result_length-1] = tmp; \
+                        std::push_heap(results, results + result_length, std::greater<>()); \
+                        curr_min_expend_cent = _mm256_set1_epi32(results[0].total_expend_cent); \
+                    } \
+                } \
+            }
+
+        _CHECK_RESULT(1)
+        _CHECK_RESULT(2)
+        _CHECK_RESULT(3)
+        _CHECK_RESULT(4)
+        _CHECK_RESULT(5)
+        _CHECK_RESULT(6)
+        _CHECK_RESULT(7)
+        _CHECK_RESULT(8)
+    }
+
+    while (p < end) {
+        const uint32_t orderdate_diff = *(p + 3) >> 30;
+        const date_t orderdate = bucket_base_orderdate + orderdate_diff;
+        const uint32_t orderkey = *(p + 3) & ~0xC0000000U;
+
+        uint32_t total_expend_cent;
+        if constexpr (_CheckShipdateDiff) {
+            total_expend_cent = 0;
+            if (p[0] >= greater_than_value_i32) total_expend_cent += p[0] & 0x00FFFFFF;
+            if (p[1] >= greater_than_value_i32) total_expend_cent += p[1] & 0x00FFFFFF;
+            if (p[2] >= greater_than_value_i32) total_expend_cent += p[2] & 0x00FFFFFF;
+        }
+        else {
+            total_expend_cent = (p[0] & 0x00FFFFFF) + (p[1] & 0x00FFFFFF) + (p[2] & 0x00FFFFFF);
+        }
+        p += 4;
+
+        _CHECK_RESULT();
+    }
+#undef _CHECK_RESULT
+}
+
+template<bool _CheckShipdateDiff>
+void scan_minor_index_check_orderdate_maybe_check_shipdate(
+    /*in*/ const uint32_t* const bucket_ptr,
+    /*in*/ const uint64_t bucket_size,
+    /*in*/ const date_t bucket_base_orderdate,
+    /*in*/ const date_t q_orderdate,
+    /*inout*/ query_result_t* const results,
+    /*inout*/ uint32_t& result_length,
+    /*in*/ const uint32_t q_topn,
+    /*in,opt*/ [[maybe_unused]] const date_t q_shipdate) noexcept
+{
+    // [[maybe_unused]] const uint32_t greater_than_value_i32 = (q_shipdate - bucket_base_orderdate) << 24 | 0x00FFFFFF;
+    if constexpr (_CheckShipdateDiff) {
+        // shipdate = bucket_base_orderdate + diff
+        // We want  shipdate > q_shipdate
+        //  <==>    bucket_base_orderdate + diff > q_shipdate
+        //  <==>    diff > q_shipdate - bucket_base_orderdate
+        ASSERT(q_shipdate >= bucket_base_orderdate);
+        ASSERT((q_shipdate - bucket_base_orderdate) < (1 << 8));
+    }
+
+    ASSERT(bucket_size % (4 * sizeof(uint32_t)) == 0);
+    const uint32_t* p = bucket_ptr;
+    const uint32_t* const end = (uint32_t*)((uintptr_t)bucket_ptr + bucket_size);
+
+    while (p < end) {
+        const uint32_t orderdate_diff = *(p + 3) >> 30;
+        const date_t orderdate = bucket_base_orderdate + orderdate_diff;
+        if (orderdate >= q_orderdate) {
+            p += 4;
+            continue;
+        }
+
+        const uint32_t orderkey = *(p + 3) & ~0xC0000000U;
+
+        uint32_t total_expend_cent;
+        if constexpr (_CheckShipdateDiff) {
+            total_expend_cent = 0;
+            // if (p[0] >= greater_than_value_i32) total_expend_cent += p[0] & 0x00FFFFFF;
+            // if (p[1] >= greater_than_value_i32) total_expend_cent += p[1] & 0x00FFFFFF;
+            // if (p[2] >= greater_than_value_i32) total_expend_cent += p[2] & 0x00FFFFFF;
+            const uint32_t value1 = *p;
+            const date_t shipdate1 = bucket_base_orderdate + (value1 >> 24);
+            total_expend_cent += (shipdate1 > q_shipdate) ? (value1 & 0x00FFFFFF) : 0;
+
+            const uint32_t value2 = *(p + 1);
+            const date_t shipdate2 = bucket_base_orderdate + (value2 >> 24);
+            total_expend_cent += (shipdate2 > q_shipdate) ? (value2 & 0x00FFFFFF) : 0;
+
+            const uint32_t value3 = *(p + 2);
+            const date_t shipdate3 = bucket_base_orderdate + (value3 >> 24);
+            total_expend_cent += (shipdate3 > q_shipdate) ? (value3 & 0x00FFFFFF) : 0;
+        }
+        else {
+            total_expend_cent = (p[0] & 0x00FFFFFF) + (p[1] & 0x00FFFFFF) + (p[2] & 0x00FFFFFF);
+        }
+        p += 4;
+
+        if (total_expend_cent > 0) {
+            query_result_t tmp;
+            tmp.orderdate = orderdate;
+            tmp.orderkey = orderkey;
+            tmp.total_expend_cent = total_expend_cent;
+
+            if (result_length < q_topn) {
+                results[result_length++] = tmp;
+                if (__unlikely(result_length == q_topn)) {
+                    std::make_heap(results, results + result_length, std::greater<>());
+                }
+            }
+            else {
+                ASSERT(result_length > 0);
+                ASSERT(result_length == q_topn);
+                if (tmp > results[0]) {
+                    std::pop_heap(results, results + result_length, std::greater<>());
+                    results[result_length-1] = tmp;
+                    std::push_heap(results, results + result_length, std::greater<>());
+                }
+            }
+        }
+    }
+}
+#endif
+
+template<bool _CheckShipdateDiff>
+void scan_major_index_nocheck_orderdate_maybe_check_shipdate(
+    /*in*/ const uint32_t* const bucket_ptr,
+    /*in*/ const uint64_t bucket_size,
+    /*in*/ const date_t bucket_base_orderdate,
+    /*inout*/ query_result_t* const results,
+    /*inout*/ uint32_t& result_length,
+    /*in*/ const uint32_t q_topn,
+    /*in,opt*/ [[maybe_unused]] const date_t q_shipdate) noexcept
+{
+    const __m256i expend_mask = _mm256_set_epi32(
+        0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+        0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
+
+    [[maybe_unused]] __m256i greater_than_value;
+    if constexpr (_CheckShipdateDiff) {
+        // shipdate = bucket_base_orderdate + diff
+        // We want  shipdate > q_shipdate
+        //  <==>    bucket_base_orderdate + diff > q_shipdate
+        //  <==>    diff > q_shipdate - bucket_base_orderdate
+        ASSERT((q_shipdate - bucket_base_orderdate) < (1 << 8));
+        greater_than_value = _mm256_set1_epi32((q_shipdate - bucket_base_orderdate) << 24 | 0x00FFFFFF);
+    }
+
+
+//    {
+//        const uint32_t* p = bucket_ptr;
+//        const uint32_t* const end = (uint32_t*)((uintptr_t)bucket_ptr + bucket_size);
+//        while (p < end) {
+//            const uint32_t orderdate_diff = *(p + 7) >> 30;
+//            const date_t orderdate = bucket_base_orderdate + orderdate_diff;
+//            const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
+//
+//            if (orderkey == 25202592) {
+//                INFO("--------> (q_shipdate - bucket_base_orderdate): %u", (q_shipdate - bucket_base_orderdate));
+//                for (uint32_t i = 0; i < 7; ++i) {
+//                    const uint32_t value = p[i];
+//                    const uint32_t shipdate_diff = value >> 24;
+//                    const uint32_t expend_cent = value & 0x00FFFFFF;
+//                    INFO("--------> shipdate_diff=%u, expend_cent=%u", shipdate_diff, expend_cent);
+//                }
+//
+//                if constexpr (_CheckShipdateDiff) {
+//                    __m256i items = _mm256_load_si256((__m256i*)p);
+//                    const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
+//                    INFO("gt_mask[%u] = 0x%08x", 0, _mm256_extract_epi32(gt_mask, 0));
+//                    INFO("gt_mask[%u] = 0x%08x", 1, _mm256_extract_epi32(gt_mask, 1));
+//                    INFO("gt_mask[%u] = 0x%08x", 2, _mm256_extract_epi32(gt_mask, 2));
+//                    INFO("gt_mask[%u] = 0x%08x", 3, _mm256_extract_epi32(gt_mask, 3));
+//                    INFO("gt_mask[%u] = 0x%08x", 4, _mm256_extract_epi32(gt_mask, 4));
+//                    INFO("gt_mask[%u] = 0x%08x", 5, _mm256_extract_epi32(gt_mask, 5));
+//                    INFO("gt_mask[%u] = 0x%08x", 6, _mm256_extract_epi32(gt_mask, 6));
+//                    INFO("gt_mask[%u] = 0x%08x", 7, _mm256_extract_epi32(gt_mask, 7));
+//                    items = _mm256_and_si256(items, gt_mask);
+//                    items = _mm256_and_si256(items, expend_mask);
+//                }
+//            }
+//            p += 8;
+//        }
+//    }
+
+    ASSERT(bucket_size % (8 * sizeof(uint32_t)) == 0);
+    const uint32_t* p = bucket_ptr;
+    const uint32_t* const end = (uint32_t*)((uintptr_t)bucket_ptr + bucket_size);
+    const uint32_t* const end_align32 = p + __align_down(bucket_size / sizeof(uint32_t), 32);
+    while (p < end_align32) {
+        const uint32_t orderdate_diff1 = *(p + 7) >> 30;
+        const date_t orderdate1 = bucket_base_orderdate + orderdate_diff1;
+        const uint32_t orderkey1 = *(p + 7) & ~0xC0000000U;
+        __m256i items1 = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask1 = _mm256_cmpgt_epi32(items1, greater_than_value);
+            items1 = _mm256_and_si256(items1, gt_mask1);
+        }
+        items1 = _mm256_and_si256(items1, expend_mask);
+
+        const uint32_t orderdate_diff2 = *(p + 7) >> 30;
+        const date_t orderdate2 = bucket_base_orderdate + orderdate_diff2;
+        const uint32_t orderkey2 = *(p + 7) & ~0xC0000000U;
+        __m256i items2 = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask2 = _mm256_cmpgt_epi32(items2, greater_than_value);
+            items2 = _mm256_and_si256(items2, gt_mask2);
+        }
+        items2 = _mm256_and_si256(items2, expend_mask);
+
+        const uint32_t orderdate_diff3 = *(p + 7) >> 30;
+        const date_t orderdate3 = bucket_base_orderdate + orderdate_diff3;
+        const uint32_t orderkey3 = *(p + 7) & ~0xC0000000U;
+        __m256i items3 = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask3 = _mm256_cmpgt_epi32(items3, greater_than_value);
+            items3 = _mm256_and_si256(items3, gt_mask3);
+        }
+        items3 = _mm256_and_si256(items3, expend_mask);
+
+        const uint32_t orderdate_diff4 = *(p + 7) >> 30;
+        const date_t orderdate4 = bucket_base_orderdate + orderdate_diff4;
+        const uint32_t orderkey4 = *(p + 7) & ~0xC0000000U;
+        __m256i items4 = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask4 = _mm256_cmpgt_epi32(items4, greater_than_value);
+            items4 = _mm256_and_si256(items4, gt_mask4);
+        }
+        items4 = _mm256_and_si256(items4, expend_mask);
+
+        // Inspired by
+        //   https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
+        const __m256i tmp1 = _mm256_hadd_epi32(items1, items2);
+        const __m256i tmp2 = _mm256_hadd_epi32(items3, items4);
+        const __m256i tmp3 = _mm256_hadd_epi32(tmp1, tmp2);
+        const __m128i tmp3lo = _mm256_castsi256_si128(tmp3);
+        const __m128i tmp3hi = _mm256_extracti128_si256(tmp3, 1);
+        const __m128i sum = _mm_add_epi32(tmp3hi, tmp3lo);
+
+        const uint32_t total_expend_cent1 = _mm_extract_epi32(sum, 0);
+        const uint32_t total_expend_cent2 = _mm_extract_epi32(sum, 1);
+        const uint32_t total_expend_cent3 = _mm_extract_epi32(sum, 2);
+        const uint32_t total_expend_cent4 = _mm_extract_epi32(sum, 3);
+
+#define _CHECK_RESULT(N) \
+            if (total_expend_cent##N > 0) { \
+                query_result_t tmp; \
+                tmp.orderdate = orderdate##N; \
+                tmp.orderkey = orderkey##N; \
+                tmp.total_expend_cent = total_expend_cent##N; \
+                \
+                if (result_length < q_topn) { \
+                    results[result_length++] = tmp; \
+                    if (__unlikely(result_length == q_topn)) { \
+                        std::make_heap(results, results + result_length, std::greater<>()); \
+                    } \
+                } \
+                else { \
+                    ASSERT(result_length > 0); \
+                    ASSERT(result_length == q_topn); \
+                    if (tmp > results[0]) { \
+                        std::pop_heap(results, results + result_length, std::greater<>()); \
+                        results[result_length-1] = tmp; \
+                        std::push_heap(results, results + result_length, std::greater<>()); \
+                    } \
+                } \
+            }
+
+        _CHECK_RESULT(1)
+        _CHECK_RESULT(2)
+        _CHECK_RESULT(3)
+        _CHECK_RESULT(4)
+    }
+
+    while (p < end) {
+        const uint32_t orderdate_diff = *(p + 7) >> 30;
+        const date_t orderdate = bucket_base_orderdate + orderdate_diff;
+        const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
+        __m256i items = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
+            //if (_mm256_testz_si256(gt_mask, gt_mask)) continue;  // not necessary
+            items = _mm256_and_si256(items, gt_mask);
+        }
+        items = _mm256_and_si256(items, expend_mask);
+
+        __m256i sum = _mm256_hadd_epi32(items, items);
+        sum = _mm256_hadd_epi32(sum, sum);
+        const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
+
+        _CHECK_RESULT();
+    }
+#undef _CHECK_RESULT
+}
+
+template<bool _CheckShipdateDiff>
+void scan_major_index_check_orderdate_maybe_check_shipdate(
+    /*in*/ const uint32_t* const bucket_ptr,
+    /*in*/ const uint64_t bucket_size,
+    /*in*/ const date_t bucket_base_orderdate,
+    /*in*/ const date_t q_orderdate,
+    /*inout*/ query_result_t* const results,
+    /*inout*/ uint32_t& result_length,
+    /*in*/ const uint32_t q_topn,
+    /*in,opt*/ [[maybe_unused]] const date_t q_shipdate) noexcept
+{
+    const __m256i expend_mask = _mm256_set_epi32(
+        0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
+        0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
+
+    [[maybe_unused]] __m256i greater_than_value;
+    if constexpr (_CheckShipdateDiff) {
+        // shipdate = bucket_base_orderdate + diff
+        // We want  shipdate > q_shipdate
+        //  <==>    bucket_base_orderdate + diff > q_shipdate
+        //  <==>    diff > q_shipdate - bucket_base_orderdate
+        ASSERT(q_shipdate >= bucket_base_orderdate);
+        ASSERT((q_shipdate - bucket_base_orderdate) < (1 << 8));
+        greater_than_value = _mm256_set1_epi32((q_shipdate - bucket_base_orderdate) << 24 | 0x00FFFFFF);
+    }
+
+    ASSERT(bucket_size % (8 * sizeof(uint32_t)) == 0);
+    const uint32_t* p = bucket_ptr;
+    const uint32_t* const end = (uint32_t*)((uintptr_t)bucket_ptr + bucket_size);
+
+    while (p < end) {
+        const uint32_t orderdate_diff = *(p + 7) >> 30;
+        const date_t orderdate = bucket_base_orderdate + orderdate_diff;
+        if (orderdate >= q_orderdate) {
+            p += 8;
+            continue;
+        }
+
+        const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
+        __m256i items = _mm256_load_si256((__m256i*)p);
+        p += 8;
+        if constexpr (_CheckShipdateDiff) {
+            const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
+            //if (_mm256_testz_si256(gt_mask, gt_mask)) continue;
+            items = _mm256_and_si256(items, gt_mask);
+        }
+        items = _mm256_and_si256(items, expend_mask);
+
+        __m256i sum = _mm256_hadd_epi32(items, items);
+        sum = _mm256_hadd_epi32(sum, sum);
+        const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
+
+        if (total_expend_cent > 0) {
+            query_result_t tmp;
+            tmp.orderdate = orderdate;
+            tmp.orderkey = orderkey;
+            tmp.total_expend_cent = total_expend_cent;
+
+            if (result_length < q_topn) {
+                results[result_length++] = tmp;
+                if (__unlikely(result_length == q_topn)) {
+                    std::make_heap(results, results + result_length, std::greater<>());
+                }
+            }
+            else {
+                ASSERT(result_length > 0);
+                ASSERT(result_length == q_topn);
+                if (tmp > results[0]) {
+                    std::pop_heap(results, results + result_length, std::greater<>());
+                    results[result_length-1] = tmp;
+                    std::push_heap(results, results + result_length, std::greater<>());
+                }
+            }
+        }
+    }
+}
+
 void fn_worker_thread_use_index(const uint32_t tid) noexcept
 {
     uint32_t global_major_workload_count = 0;
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+    uint32_t global_minor_workload_count = 0;
+#endif
     while (true) {
         g_start_working_sem.wait();
 
@@ -940,450 +1523,6 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
         if (qid == -1) break;
         query_t& query = g_queries[qid];
         g_pretopn_queries_done[qid].wait_done();
-
-        const date_t q_shipdate = query.q_shipdate;
-        uint32_t* p;
-        uint32_t* end;
-        date_t base_orderdate;
-
-        uint64_t bucket_size_major;
-
-        const auto scan_major_workload_type0 = [&]() {
-            DEBUG("[#%u] query%u scan major type0 orderdate %u, q_orderdate %u, q_shipdate %u",
-                tid, qid, base_orderdate, query.q_orderdate, q_shipdate
-            );
-            // ASSERT(q_shipdate >= base_orderdate);
-            // ASSERT((q_shipdate - base_orderdate) < (1 << 8));
-            const __m256i expend_mask = _mm256_set_epi32(
-                0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
-                0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
-            __m256i greater_than_value;
-            if (q_shipdate >= base_orderdate) {
-                greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
-            }
-            else {
-                greater_than_value = _mm256_set1_epi32(0);
-            }
-
-//             uint32_t count = 0;
-//             __m256i items1, items2, items3, items4;
-//             uint32_t orderkey1, orderkey2, orderkey3, orderkey4;
-//             date_t orderdate1, orderdate2, orderdate3, orderdate4;
-//             while (p < end) {
-//                 while (p < end) {
-//                     const uint32_t orderdate_diff1 = *(p + 7) >> 30;
-//                     orderdate1 = base_orderdate + orderdate_diff1;
-//                     if (orderdate1 < query.d_scan_begin || orderdate1 >= query.d_scan_end) {
-//                         p += 8;
-//                         continue;
-//                     }
-//                     else {
-//                         orderkey1 = *(p + 7) & ~0xC0000000U;
-//                         items1 = _mm256_load_si256((__m256i*)p);
-//                         p += 8;
-//                         const __m256i gt_mask1 = _mm256_cmpgt_epi32(items1, greater_than_value);
-//                         if (_mm256_testz_si256(gt_mask1, gt_mask1)) continue;
-//                         items1 = _mm256_and_si256(items1, gt_mask1);
-//                         items1 = _mm256_and_si256(items1, expend_mask);
-//                         ++count;
-//                         break;
-//                     }
-//                 }
-//                 if (p >= end) break;
-
-//                 while (p < end) {
-//                     const uint32_t orderdate_diff2 = *(p + 7) >> 30;
-//                     orderdate2 = base_orderdate + orderdate_diff2;
-//                     if (orderdate2 < query.d_scan_begin || orderdate2 >= query.d_scan_end) {
-//                         p += 8;
-//                         continue;
-//                     }
-//                     else {
-//                         orderkey2 = *(p + 7) & ~0xC0000000U;
-//                         items2 = _mm256_load_si256((__m256i*)p);
-//                         p += 8;
-//                         const __m256i gt_mask2 = _mm256_cmpgt_epi32(items2, greater_than_value);
-//                         if (_mm256_testz_si256(gt_mask2, gt_mask2)) continue;
-//                         items2 = _mm256_and_si256(items2, gt_mask2);
-//                         items2 = _mm256_and_si256(items2, expend_mask);
-//                         ++count;
-//                         break;
-//                     }
-//                 }
-//                 if (p >= end) break;
-
-//                 while (p < end) {
-//                     const uint32_t orderdate_diff3 = *(p + 7) >> 30;
-//                     orderdate3 = base_orderdate + orderdate_diff3;
-//                     if (orderdate3 < query.d_scan_begin || orderdate3 >= query.d_scan_end) {
-//                         p += 8;
-//                         continue;
-//                     }
-//                     else {
-//                         orderkey3 = *(p + 7) & ~0xC0000000U;
-//                         items3 = _mm256_load_si256((__m256i*)p);
-//                         p += 8;
-//                         const __m256i gt_mask3 = _mm256_cmpgt_epi32(items3, greater_than_value);
-//                         if (_mm256_testz_si256(gt_mask3, gt_mask3)) continue;
-//                         items3 = _mm256_and_si256(items3, gt_mask3);
-//                         items3 = _mm256_and_si256(items3, expend_mask);
-//                         ++count;
-//                         break;
-//                     }
-//                 }
-//                 if (p >= end) break;
-
-//                 while (p < end) {
-//                     const uint32_t orderdate_diff4 = *(p + 7) >> 30;
-//                     orderdate4 = base_orderdate + orderdate_diff4;
-//                     if (orderdate4 < query.d_scan_begin || orderdate4 >= query.d_scan_end) {
-//                         p += 8;
-//                         continue;
-//                     }
-//                     else {
-//                         orderkey4 = *(p + 7) & ~0xC0000000U;
-//                         items4 = _mm256_load_si256((__m256i*)p);
-//                         p += 8;
-//                         const __m256i gt_mask4 = _mm256_cmpgt_epi32(items4, greater_than_value);
-//                         if (_mm256_testz_si256(gt_mask4, gt_mask4)) continue;
-//                         items4 = _mm256_and_si256(items4, gt_mask4);
-//                         items4 = _mm256_and_si256(items4, expend_mask);
-//                         ++count;
-//                         break;
-//                     }
-//                 }
-//                 // if (p >= end) break;
-//                 if (count % 4 != 0) {
-//                     break;
-//                 }
-
-//                 // TODO: looks for better way!
-//                 // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
-//                 const __m256i tmp1 = _mm256_hadd_epi32(items1, items2);
-//                 const __m256i tmp2 = _mm256_hadd_epi32(items3, items4);
-//                 const __m256i tmp3 = _mm256_hadd_epi32(tmp1, tmp2);
-//                 const __m128i tmp3lo = _mm256_castsi256_si128(tmp3);
-//                 const __m128i tmp3hi = _mm256_extracti128_si256(tmp3, 1);
-//                 const __m128i sum = _mm_add_epi32(tmp3hi, tmp3lo);
-
-//                 const uint32_t total_expend_cent1 = _mm_extract_epi32(sum, 0);
-//                 const uint32_t total_expend_cent2 = _mm_extract_epi32(sum, 1);
-//                 const uint32_t total_expend_cent3 = _mm_extract_epi32(sum, 2);
-//                 const uint32_t total_expend_cent4 = _mm_extract_epi32(sum, 3);
-
-// #define _CHECK_RESULT(N) \
-//                 /* ASSERT(total_expend_cent##N > 0); */ \
-//                 if (__likely(total_expend_cent##N > 0)) { \
-//                     query_result_t tmp; \
-//                     tmp.orderdate = orderdate##N; \
-//                     tmp.orderkey = orderkey##N; \
-//                     tmp.total_expend_cent = total_expend_cent##N; \
-//                     \
-//                     if (query.result_size < query.q_topn) { \
-//                         query.result[query.result_size++] = tmp; \
-//                         if (__unlikely(query.result_size == query.q_topn)) { \
-//                             std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                         } \
-//                     } \
-//                     else { \
-//                         if (tmp > query.result[0]) { \
-//                             std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                             query.result[query.result_size - 1] = tmp; \
-//                             std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                         } \
-//                     } \
-//                 }
-
-//                 _CHECK_RESULT(1)
-//                 _CHECK_RESULT(2)
-//                 _CHECK_RESULT(3)
-//                 _CHECK_RESULT(4)
-// #undef _CHECK_RESULT
-//             }
-//             ASSERT(p >= end);
-
-// #define _CHECK_ITEM_RESULT(N) {\
-//                 __m256i sum = _mm256_hadd_epi32(items##N, items##N); \
-//                 sum = _mm256_hadd_epi32(sum, sum); \
-//                 const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4); \
-//                 /* ASSERT(total_expend_cent > 0); */ \
-//                 if (__likely(total_expend_cent > 0)) { \
-//                     query_result_t tmp; \
-//                     tmp.orderdate = orderdate##N; \
-//                     tmp.orderkey = orderkey##N; \
-//                     tmp.total_expend_cent = total_expend_cent; \
-//                     \
-//                     if (query.result_size < query.q_topn) { \
-//                         query.result[query.result_size++] = tmp; \
-//                         if (__unlikely(query.result_size == query.q_topn)) { \
-//                             std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                         } \
-//                     } \
-//                     else { \
-//                         if (tmp > query.result[0]) { \
-//                             std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                             query.result[query.result_size - 1] = tmp; \
-//                             std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-//                         } \
-//                     } \
-//                 } \
-//             }
-
-//             switch (count % 4) {
-//             case 3: 
-//                 _CHECK_ITEM_RESULT(3)
-//             case 2:
-//                 _CHECK_ITEM_RESULT(2)
-//             case 1:
-//                 _CHECK_ITEM_RESULT(1)
-//             }
-// #undef _CHECK_ITEM_RESULT
-            while (p < end) {
-                const uint32_t orderdate_diff = *(p + 7) >> 30;
-                const date_t orderdate = base_orderdate + orderdate_diff;
-                if (orderdate >= query.q_orderdate) {
-                    p += 8;
-                    continue;
-                }
-
-                const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
-                __m256i items = _mm256_load_si256((__m256i*)p);
-                p += 8;
-                const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
-                //if (_mm256_testz_si256(gt_mask, gt_mask)) continue;
-                items = _mm256_and_si256(items, gt_mask);
-                items = _mm256_and_si256(items, expend_mask);
-
-                __m256i sum = _mm256_hadd_epi32(items, items);
-                sum = _mm256_hadd_epi32(sum, sum);
-                const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
-
-                if (total_expend_cent > 0) {
-                    query_result_t tmp;
-                    tmp.orderdate = orderdate;
-                    tmp.orderkey = orderkey;
-                    tmp.total_expend_cent = total_expend_cent;
-
-                    if (query.result_size < query.q_topn) {
-                        query.result[query.result_size++] = tmp;
-                        if (__unlikely(query.result_size == query.q_topn)) {
-                            std::make_heap(query.result, query.result + query.result_size, std::greater<>());
-                        }
-                    }
-                    else {
-                        ASSERT(query.result_size > 0);
-                        ASSERT(query.result_size == query.q_topn);
-                        if (tmp > query.result[0]) {
-                            std::pop_heap(query.result, query.result + query.result_size, std::greater<>());
-                            query.result[query.result_size-1] = tmp;
-                            std::push_heap(query.result, query.result + query.result_size, std::greater<>());
-                        }
-                    }
-                }
-            }
-
-        };
-
-
-        const auto scan_major_workload_type12 = [&](uint8_t type) {
-            ASSERT(type == 1 || type == 2);
-            const __m256i expend_mask = _mm256_set_epi32(
-                0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
-                0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
-            __m256i greater_than_value;
-            if (type == 1) {
-                if (q_shipdate >= base_orderdate) {
-                    greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
-                }
-                else {
-                    greater_than_value = _mm256_set1_epi32(0);
-                }
-                // greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
-            }
-            const uint32_t* const end_align32 = p + __align_down(bucket_size_major / sizeof(uint32_t), 32);
-            while (p < end_align32) {
-                const uint32_t orderdate_diff1 = *(p + 7) >> 30;
-                const date_t orderdate1 = base_orderdate + orderdate_diff1;
-                const uint32_t orderkey1 = *(p + 7) & ~0xC0000000U;
-                __m256i items1 = _mm256_load_si256((__m256i*)p);
-                p += 8;
-                if (type == 1) {
-                    const __m256i gt_mask1 = _mm256_cmpgt_epi32(items1, greater_than_value);
-                    items1 = _mm256_and_si256(items1, gt_mask1);
-                }
-                items1 = _mm256_and_si256(items1, expend_mask);
-
-                const uint32_t orderdate_diff2 = *(p + 7) >> 30;
-                const date_t orderdate2 = base_orderdate + orderdate_diff2;
-                const uint32_t orderkey2 = *(p + 7) & ~0xC0000000U;
-                __m256i items2 = _mm256_load_si256((__m256i*)p);
-                p += 8;
-                if (type == 1) {
-                    const __m256i gt_mask2 = _mm256_cmpgt_epi32(items2, greater_than_value);
-                    items2 = _mm256_and_si256(items2, gt_mask2);
-                }
-                items2 = _mm256_and_si256(items2, expend_mask);
-
-                const uint32_t orderdate_diff3 = *(p + 7) >> 30;
-                const date_t orderdate3 = base_orderdate + orderdate_diff3;
-                const uint32_t orderkey3 = *(p + 7) & ~0xC0000000U;
-                __m256i items3 = _mm256_load_si256((__m256i*)p);
-                p += 8;
-                if (type == 1) {
-                    const __m256i gt_mask3 = _mm256_cmpgt_epi32(items3, greater_than_value);
-                    items3 = _mm256_and_si256(items3, gt_mask3);
-                }
-                items3 = _mm256_and_si256(items3, expend_mask);
-
-                const uint32_t orderdate_diff4 = *(p + 7) >> 30;
-                const date_t orderdate4 = base_orderdate + orderdate_diff4;
-                const uint32_t orderkey4 = *(p + 7) & ~0xC0000000U;
-                __m256i items4 = _mm256_load_si256((__m256i*)p);
-                p += 8;
-                if (type == 1) {
-                    const __m256i gt_mask4 = _mm256_cmpgt_epi32(items4, greater_than_value);
-                    items4 = _mm256_and_si256(items4, gt_mask4);
-                }
-                items4 = _mm256_and_si256(items4, expend_mask);
-
-                // TODO: looks for better way!
-                // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
-                const __m256i tmp1 = _mm256_hadd_epi32(items1, items2);
-                const __m256i tmp2 = _mm256_hadd_epi32(items3, items4);
-                const __m256i tmp3 = _mm256_hadd_epi32(tmp1, tmp2);
-                const __m128i tmp3lo = _mm256_castsi256_si128(tmp3);
-                const __m128i tmp3hi = _mm256_extracti128_si256(tmp3, 1);
-                const __m128i sum = _mm_add_epi32(tmp3hi, tmp3lo);
-
-                const uint32_t total_expend_cent1 = _mm_extract_epi32(sum, 0);
-                const uint32_t total_expend_cent2 = _mm_extract_epi32(sum, 1);
-                const uint32_t total_expend_cent3 = _mm_extract_epi32(sum, 2);
-                const uint32_t total_expend_cent4 = _mm_extract_epi32(sum, 3);
-
-#define _CHECK_RESULT(N) \
-                if (total_expend_cent##N > 0) { \
-                    query_result_t tmp; \
-                    tmp.orderdate = orderdate##N; \
-                    tmp.orderkey = orderkey##N; \
-                    tmp.total_expend_cent = total_expend_cent##N; \
-                    \
-                    if (query.result_size < query.q_topn) { \
-                        query.result[query.result_size++] = tmp; \
-                        if (__unlikely(query.result_size == query.q_topn)) { \
-                            std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-                        } \
-                    } \
-                    else { \
-                        if (tmp > query.result[0]) { \
-                            std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-                            query.result[query.result_size - 1] = tmp; \
-                            std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>()); \
-                        } \
-                    } \
-                }
-
-                _CHECK_RESULT(1)
-                _CHECK_RESULT(2)
-                _CHECK_RESULT(3)
-                _CHECK_RESULT(4)
-#undef _CHECK_RESULT
-            }
-
-
-            while (p < end) {
-                const uint32_t orderdate_diff = *(p + 7) >> 30;
-                const date_t orderdate = base_orderdate + orderdate_diff;
-                const uint32_t orderkey = *(p + 7) & ~0xC0000000U;
-
-                __m256i items = _mm256_load_si256((__m256i*)p);
-                p += 8;
-
-                if (type == 1) {
-                    const __m256i gt_mask = _mm256_cmpgt_epi32(items, greater_than_value);
-                    if (_mm256_testz_si256(gt_mask, gt_mask)) continue;
-
-                    items = _mm256_and_si256(items, gt_mask);
-                }
-                items = _mm256_and_si256(items, expend_mask);
-
-                // TODO: looks for better way!
-                // See https://stackoverflow.com/questions/9775538/fastest-way-to-do-horizontal-vector-sum-with-avx-instructions
-                __m256i sum = _mm256_hadd_epi32(items, items);
-                sum = _mm256_hadd_epi32(sum, sum);
-                const uint32_t total_expend_cent = _mm256_extract_epi32(sum, 0) + _mm256_extract_epi32(sum, 4);
-                // ASSERT(total_expend_cent > 0);
-                if(__likely(total_expend_cent > 0)) {
-                    query_result_t tmp;
-                    tmp.orderdate = orderdate;
-                    tmp.orderkey = orderkey;
-                    tmp.total_expend_cent = total_expend_cent;
-
-                    if (query.result_size < query.q_topn) {
-                        query.result[query.result_size++] = tmp;
-                        if (__unlikely(query.result_size == query.q_topn)) {
-                            std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                        }
-                    }
-                    else {
-                        if (tmp > query.result[0]) {
-                            std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                            query.result[query.result_size - 1] = tmp;
-                            std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                        }
-                    }
-                }
-            }
-        };
-
-#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
-        uint64_t bucket_size_minor;
-
-        const auto scan_minor_workload_type012 = [&]() {
-            while (p < end) {
-                const uint32_t orderdate_diff = *(p + 3) >> 30;
-                const date_t orderdate = base_orderdate + orderdate_diff;
-                if (orderdate >= query.q_orderdate) {
-                    p += 4;
-                    continue;
-                }
-                const uint32_t orderkey = *(p + 3) & ~0xC0000000U;
-                uint32_t total_expend_cent = 0;
-
-                const uint32_t value1 = *p;
-                const date_t shipdate1 = base_orderdate + (value1 >> 24);
-                total_expend_cent += (shipdate1 > query.q_shipdate) ? (value1 & 0x00FFFFFF) : 0;
-
-                const uint32_t value2 = *(p + 1);
-                const date_t shipdate2 = base_orderdate + (value2 >> 24);
-                total_expend_cent += (shipdate2 > query.q_shipdate) ? (value2 & 0x00FFFFFF) : 0;
-
-                const uint32_t value3 = *(p + 2);
-                const date_t shipdate3 = base_orderdate + (value3 >> 24);
-                total_expend_cent += (shipdate3 > query.q_shipdate) ? (value3 & 0x00FFFFFF) : 0;
-
-                p += 4;
-
-                query_result_t tmp;
-                tmp.orderdate = orderdate;
-                tmp.orderkey = orderkey;
-                tmp.total_expend_cent = total_expend_cent;
-
-                if (query.result_size < query.q_topn) {
-                    query.result[query.result_size++] = tmp;
-                    if (__unlikely(query.result_size == query.q_topn)) {
-                        std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                    }
-                }
-                else {
-                    if (tmp > query.result[0]) {
-                        std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                        query.result[query.result_size - 1] = tmp;
-                        std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                    }
-                }
-            }
-        };
-#endif
 
         workload_info_t workload_info;
         uint32_t major_workload_count = 0;
@@ -1393,35 +1532,66 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
                 major_workload_count, global_major_workload_count,
                 workload_info.orderdate, workload_info.type, workload_info.index
             );
-            base_orderdate = workload_info.orderdate;
+            const date_t base_orderdate = workload_info.orderdate;
             const uint32_t bucket_id = calc_bucket_index(query.q_mktid, base_orderdate);
             const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
             const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
 
             const uintptr_t bucket_start_offset_major = (uint64_t)CONFIG_INDEX_SPARSE_BUCKET_SIZE_MAJOR * (bucket_id - begin_bucket_id);
-            bucket_size_major = g_endoffset_major_ptr[bucket_id] - bucket_start_offset_major;
-            p = (uint32_t*)((uintptr_t)g_major_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_major_workload_mmap_size));
-            end = (uint32_t*)((uintptr_t)p + (uintptr_t)bucket_size_major);
+            const uint64_t bucket_size_major = g_endoffset_major_ptr[bucket_id] - bucket_start_offset_major;
+            uint32_t* p = (uint32_t*)((uintptr_t)g_major_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_major_workload_mmap_size));
             ASSERT(bucket_size_major % (8 * sizeof(uint32_t)) == 0);
 
             switch(workload_info.type) {
             case 0:
-                scan_major_workload_type0();
+                scan_major_index_check_orderdate_maybe_check_shipdate<true>(
+                    p,
+                    bucket_size_major,
+                    base_orderdate,
+                    query.q_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
                 break;
             case 1:
-                // break;
+                scan_major_index_check_orderdate_maybe_check_shipdate<false>(
+                    p,
+                    bucket_size_major,
+                    base_orderdate,
+                    query.q_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
+                break;
             case 2:
-                scan_major_workload_type12(workload_info.type);
+                scan_major_index_nocheck_orderdate_maybe_check_shipdate<true>(
+                    p,
+                    bucket_size_major,
+                    base_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
+                break;
+            case 3:
+                scan_major_index_nocheck_orderdate_maybe_check_shipdate<false>(
+                    p,
+                    bucket_size_major,
+                    base_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
                 break;
             default:
-                ASSERT(workload_info.type <= 2);
+                ASSERT(workload_info.type <= 3);
             }
-            // if (workload_info.type == 0) {
-            //     scan_major_workload_type0();
-            // }
-            // else {
-            //     scan_major_workload_type12(workload_info.type);
-            // }
 
             g_major_workload_index_bag.return_back(workload_info.index);
             TRACE("[#%u] query%u returned back %uth(g%u) mmap workload to major_bag",
@@ -1431,34 +1601,89 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             ++major_workload_count;
             ++global_major_workload_count;
         }
+        DEBUG("[#%u] query%u finished scaning major workload",
+            tid, qid
+        );
 #if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+    uint32_t minor_workload_count = 0;
         while (g_minor_workload_info_queue.pop(&workload_info)) {
-            base_orderdate = workload_info.orderdate;
+            TRACE("[#%u] query%u poped %uth(g%u) mmap workload from minor_queue, <%u,%u,%u>",
+                tid, qid,
+                minor_workload_count, global_minor_workload_count,
+                workload_info.orderdate, workload_info.type, workload_info.index
+            );
+            const date_t base_orderdate = workload_info.orderdate;
             const uint32_t bucket_id = calc_bucket_index(query.q_mktid, base_orderdate);
             const uint32_t holder_id = bucket_id / g_shared->buckets_per_holder;
             const uint32_t begin_bucket_id = holder_id * g_shared->buckets_per_holder;
 
             const uintptr_t bucket_start_offset_minor = (uint64_t)CONFIG_INDEX_SPARSE_BUCKET_SIZE_MINOR * (bucket_id - begin_bucket_id);
-            bucket_size_minor = g_endoffset_minor_ptr[bucket_id] - bucket_start_offset_minor;
-            p = (uint32_t*)((uintptr_t)g_minor_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_minor_workload_mmap_size));
-            end = (uint32_t*)((uintptr_t)p + (uintptr_t)bucket_size_minor);
-            ASSERT(bucket_size_minor % (8 * sizeof(uint32_t)) == 0);
+            const uint64_t bucket_size_minor = g_endoffset_minor_ptr[bucket_id] - bucket_start_offset_minor;
+            const uint32_t* p = (uint32_t*)((uintptr_t)g_minor_workload_mmap_base_ptr + (uintptr_t)(workload_info.index * g_minor_workload_mmap_size));
+            ASSERT(bucket_size_minor % (4 * sizeof(uint32_t)) == 0);
 
             switch(workload_info.type) {
             case 0:
-                // scan_minor_workload_type0();
-                // break;
+                scan_minor_index_check_orderdate_maybe_check_shipdate<true>(
+                    p,
+                    bucket_size_minor,
+                    base_orderdate,
+                    query.q_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
+                break;
             case 1:
-                // break;
+                scan_minor_index_check_orderdate_maybe_check_shipdate<false>(
+                    p,
+                    bucket_size_minor,
+                    base_orderdate,
+                    query.q_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
+                break;
             case 2:
-                scan_minor_workload_type012();
+                scan_minor_index_nocheck_orderdate_maybe_check_shipdate<true>(
+                    p,
+                    bucket_size_minor,
+                    base_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
+                break;
+            case 3:
+                scan_minor_index_nocheck_orderdate_maybe_check_shipdate<false>(
+                    p,
+                    bucket_size_minor,
+                    base_orderdate,
+                    query.result,
+                    query.result_size,
+                    query.q_topn,
+                    query.q_shipdate
+                );
                 break;
             default:
-                ASSERT(workload_info.type <= 2);
+                ASSERT(workload_info.type <= 3);
             }
 
             g_minor_workload_index_bag.return_back(workload_info.index);
+            TRACE("[#%u] query%u returned back %uth(g%u) mmap workload to minor_bag",
+                tid, qid,
+                minor_workload_count, global_minor_workload_count
+            );
+            ++minor_workload_count;
+            ++global_minor_workload_count;
         }
+        DEBUG("[#%u] query%u finished scaning minor workload",
+            tid, qid
+        );
 #endif
         std::sort(&query.result[0], &query.result[query.result_size], std::greater<>());
 
