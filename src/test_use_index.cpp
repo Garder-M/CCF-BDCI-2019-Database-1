@@ -1687,28 +1687,89 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 #endif
         std::sort(&query.result[0], &query.result[query.result_size], std::greater<>());
 
+        // //
+        // // print query to string
+        // //
+        // std::string output;
+        // const auto append_u32 = [&](const uint32_t n) noexcept {
+        //     ASSERT(n > 0);
+        //     output += std::to_string(n);  // TODO: implement it!
+        // };
+        // const auto append_u32_width2 = [&](const uint32_t n) noexcept {
+        //     ASSERT(n <= 99);
+        //     output += (char)('0' + n / 10);
+        //     output += (char)('0' + n % 10);
+        // };
+        // const auto append_u32_width4 = [&](const uint32_t n) noexcept {
+        //     ASSERT(n <= 9999);
+        //     output += (char)('0' + (n       ) / 1000);
+        //     output += (char)('0' + (n % 1000) / 100);
+        //     output += (char)('0' + (n % 100 ) / 10);
+        //     output += (char)('0' + (n % 10 )  / 1);
+        // };
+        // output.reserve((size_t)(query.q_topn + 1) * 40);  // max line length: ~32, reserved to 40
+        // output += "l_orderkey|o_orderdate|revenue\n";
+        // for (uint32_t i = 0; i < query.result_size; ++i) {
+        //     //printf("%u|%u-%02u-%02u|%u.%02u\n",
+        //     //       line.orderkey,
+        //     //       std::get<0>(ymd), std::get<1>(ymd), std::get<2>(ymd),
+        //     //       line.total_expend_cent / 100, line.total_expend_cent % 100);
+        //     const query_result_t& line = query.result[i];
+        //     const auto ymd = date_get_ymd(line.orderdate);
+        //     append_u32(((line.orderkey & ~0b111) << 2) | (line.orderkey & 0b111));
+        //     output += '|';
+        //     append_u32_width4(std::get<0>(ymd));
+        //     output += '-';
+        //     append_u32_width2(std::get<1>(ymd));
+        //     output += '-';
+        //     append_u32_width2(std::get<2>(ymd));
+        //     output += '|';
+        //     append_u32(line.total_expend_cent / 100);
+        //     output += '.';
+        //     append_u32_width2(line.total_expend_cent % 100);
+        //     output += '\n';
+        // }
+        
+        // query.output_size = output.size();
+        // CHECK(query.output_size <= (query.q_topn + 1) * 40);
+        // memcpy(query.output, output.c_str(), query.output_size);
+
         //
         // print query to string
         //
-        std::string output;
-        const auto append_u32 = [&](const uint32_t n) noexcept {
-            ASSERT(n > 0);
-            output += std::to_string(n);  // TODO: implement it!
+        char* const output = query.output;
+        // uint64_t& output_size = query.output_size;
+        uint64_t output_size = 0;
+
+        constexpr const char header[] = "l_orderkey|o_orderdate|revenue\n";
+        memcpy(output, header, std::size(header) - 1);
+        output_size = std::size(header) - 1;
+
+        const auto append_u32 = [&](uint32_t n) __attribute__((always_inline)) noexcept {
+            char buffer[10];
+            size_t pos = std::size(buffer);
+            do {
+                buffer[--pos] = (char)('0' + n % 10);
+                n /= 10;
+            } while(n > 0);
+
+            ASSERT(pos < std::size(buffer));
+            memcpy(output + output_size, &buffer[pos], std::size(buffer) - pos);
+            output_size += std::size(buffer) - pos;
         };
-        const auto append_u32_width2 = [&](const uint32_t n) noexcept {
+        const auto append_u32_width2 = [&](const uint32_t n) __attribute__((always_inline)) noexcept {
             ASSERT(n <= 99);
-            output += (char)('0' + n / 10);
-            output += (char)('0' + n % 10);
+            output[output_size++] = (char)('0' + n / 10);
+            output[output_size++] = (char)('0' + n % 10);
         };
-        const auto append_u32_width4 = [&](const uint32_t n) noexcept {
+        const auto append_u32_width4 = [&](const uint32_t n) __attribute__((always_inline)) noexcept {
             ASSERT(n <= 9999);
-            output += (char)('0' + (n       ) / 1000);
-            output += (char)('0' + (n % 1000) / 100);
-            output += (char)('0' + (n % 100 ) / 10);
-            output += (char)('0' + (n % 10 )  / 1);
+            output[output_size++] = (char)('0' + (n       ) / 1000);
+            output[output_size++] = (char)('0' + (n % 1000) / 100);
+            output[output_size++] = (char)('0' + (n % 100 ) / 10);
+            output[output_size++] = (char)('0' + (n % 10  ) / 1);
         };
-        output.reserve((size_t)(query.q_topn + 1) * 40);  // max line length: ~32, reserved to 40
-        output += "l_orderkey|o_orderdate|revenue\n";
+
         for (uint32_t i = 0; i < query.result_size; ++i) {
             //printf("%u|%u-%02u-%02u|%u.%02u\n",
             //       line.orderkey,
@@ -1717,22 +1778,20 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             const query_result_t& line = query.result[i];
             const auto ymd = date_get_ymd(line.orderdate);
             append_u32(((line.orderkey & ~0b111) << 2) | (line.orderkey & 0b111));
-            output += '|';
+            output[output_size++] = '|';
             append_u32_width4(std::get<0>(ymd));
-            output += '-';
+            output[output_size++] = '-';
             append_u32_width2(std::get<1>(ymd));
-            output += '-';
+            output[output_size++] = '-';
             append_u32_width2(std::get<2>(ymd));
-            output += '|';
+            output[output_size++] = '|';
             append_u32(line.total_expend_cent / 100);
-            output += '.';
+            output[output_size++] = '.';
             append_u32_width2(line.total_expend_cent % 100);
-            output += '\n';
+            output[output_size++] = '\n';
         }
-        
-        query.output_size = output.size();
+        query.output_size = output_size;
         CHECK(query.output_size <= (query.q_topn + 1) * 40);
-        memcpy(query.output, output.c_str(), query.output_size);
 
         INFO("[#%u] query #%u done", tid, qid);
         g_queries_done[qid].mark_done();
