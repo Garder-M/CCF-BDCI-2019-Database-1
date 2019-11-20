@@ -655,6 +655,9 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
                 queue_head, queue_tail
         );
         g_major_workload_info_queue.reinit();
+#if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
+        g_minor_workload_info_queue.reinit();
+#endif
         g_start_working_sem.post();
         query_t& query = g_queries[qid];
 
@@ -1172,15 +1175,6 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
                 0x00000000, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF,
                 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF, 0x00FFFFFF);
             __m256i greater_than_value;
-            // if (base_orderdate > q_shipdate) {
-            //     greater_than_value = _mm256_set1_epi32(0);  // TODO: dummy. remove!
-            // }
-            // else if (q_shipdate - base_orderdate >= 128) {
-            //     greater_than_value = _mm256_set1_epi32(0x7FFFFFFF);  // TODO: dummy. remove!
-            // }
-            // else {  // base_orderdate <= q_shipdate < base_orderdate + 128
-            //     greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);  // TODO: dummy. remove!
-            // }
             if (type == 1) {
                 if (q_shipdate >= base_orderdate) {
                     greater_than_value = _mm256_set1_epi32(((q_shipdate - base_orderdate) << 24) | 0x00ffffff);
@@ -1327,48 +1321,54 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 
 #if ENABLE_CPU_HANDLE_MINOR_WORKLOAD
         uint64_t bucket_size_minor;
-        uint32_t total_expend_cent = 0;
-        date_t orderdate;
-        const auto maybe_update_topn = [&](const uint32_t orderkey) {
-            if (__unlikely(total_expend_cent == 0)) {
-                return;
-            }
-            query_result_t tmp;
-            tmp.orderdate = orderdate;
-            tmp.orderkey = orderkey;
-            tmp.total_expend_cent = total_expend_cent;
-
-            if (query.result_size < query.q_topn) {
-                query.result[query.result_size++] = tmp;
-                if (__unlikely(query.result_size == query.q_topn)) {
-                    std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                }
-            }
-            else {
-                if (tmp > query.result[0]) {
-                    std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                    query.result[query.result_size - 1] = tmp;
-                    std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
-                }
-            }
-        };
 
         const auto scan_minor_workload_type012 = [&]() {
             while (p < end) {
-                const uint32_t value = *p;
-                if (value & 0x80000000) {  // This is orderkey?
-                    orderdate = base_orderdate + ((value >> 30) & 1);
-                    const uint32_t orderkey = value & ~0xC0000000U;
-                    if (orderdate >= query.d_scan_begin && orderdate < query.d_scan_end) {
-                        maybe_update_topn(orderkey);
+                const uint32_t orderdate_diff = *(p + 3) >> 30;
+                const date_t orderdate = base_orderdate + orderdate_diff;
+                if (orderdate >= query.q_orderdate) {
+                    p += 4;
+                    continue;
+                }
+                const uint32_t orderkey = *(p + 3) & ~0xC0000000U;
+                uint32_t total_expend_cent = 0;
+
+                const uint32_t value1 = *p;
+                const date_t shipdate1 = base_orderdate + (value1 >> 24);
+                if (shipdate1 > query.q_shipdate) {
+                    total_expend_cent += (value1 & 0x00FFFFFF);
+                }
+
+                const uint32_t value2 = *(p + 1);
+                const date_t shipdate2 = base_orderdate + (value2 >> 24);
+                if (shipdate2 > query.q_shipdate) {
+                    total_expend_cent += (value2 & 0x00FFFFFF);
+                }
+
+                const uint32_t value3 = *(p + 2);
+                const date_t shipdate3 = base_orderdate + (value3 >> 24);
+                if (shipdate3 > query.q_shipdate) {
+                    total_expend_cent += (value3 & 0x00FFFFFF);
+                }
+
+                p += 4;
+
+                query_result_t tmp;
+                tmp.orderdate = orderdate;
+                tmp.orderkey = orderkey;
+                tmp.total_expend_cent = total_expend_cent;
+
+                if (query.result_size < query.q_topn) {
+                    query.result[query.result_size++] = tmp;
+                    if (__unlikely(query.result_size == query.q_topn)) {
+                        std::make_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
                     }
-                    total_expend_cent = 0;
                 }
                 else {
-                    const date_t shipdate = base_orderdate + (value >> 24);
-                    if (shipdate > query.q_shipdate) {
-                        const uint32_t expend_cent = value & 0x00FFFFFF;
-                        total_expend_cent += expend_cent;
+                    if (tmp > query.result[0]) {
+                        std::pop_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
+                        query.result[query.result_size - 1] = tmp;
+                        std::push_heap(&query.result[0], &query.result[query.result_size], std::greater<>());
                     }
                 }
             }
@@ -1446,7 +1446,6 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
             default:
                 ASSERT(workload_info.type <= 2);
             }
-            // scan_minor_workload_type012();
 
             g_minor_workload_index_bag.return_back(workload_info.index);
         }

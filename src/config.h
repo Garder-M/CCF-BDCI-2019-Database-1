@@ -99,7 +99,7 @@ static_assert(CONFIG_TOPN_DATES_PER_PLATE % CONFIG_ORDERDATES_PER_BUCKET == 0);
 
 // "N" in top-N when pre-calculating
 // If this threshold is exceeded, we can't make use of the pretopn index any more (fallback to normal index scan)
-#define CONFIG_EXPECT_MAX_TOPN              (10240U)  // According to problem description: 10000
+#define CONFIG_EXPECT_MAX_TOPN              (102400U)  // According to problem description: 10000
 static_assert((sizeof(uint64_t) * CONFIG_EXPECT_MAX_TOPN) % PAGE_SIZE == 0);
 
 #endif  // !defined(_BDCI19_CONFIG_H_INCLUDED_)
