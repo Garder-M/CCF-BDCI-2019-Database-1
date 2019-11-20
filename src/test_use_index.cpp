@@ -625,6 +625,22 @@ void fn_pretopn_thread_use_index(const uint32_t tid) noexcept
             tid, qid, task_id);
         g_pretopn_queries_done[qid].mark_done();
     }
+
+    g_shared->pretopn_sync_barrier.sync_and_run_once([]() {
+        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
+            TRACE("outputer begin to wait for query%u", qid);
+            g_queries_done[qid].wait_done();
+
+            // print query
+            const query_t& query = g_queries[qid];
+#if defined(MAKE_FASTEST)
+            const size_t cnt = fwrite(query.output, sizeof(char), query.output_size, stdout);
+            CHECK(cnt == query.output_size);
+#endif
+            DEBUG("query%u result length%u, done", qid, query.output_size);
+        }
+        C_CALL(fflush(stdout));
+    });
 }
 
 void fn_loader_thread_use_index(const uint32_t tid) noexcept
@@ -896,21 +912,21 @@ void fn_loader_thread_use_index(const uint32_t tid) noexcept
 
     INFO("loader %u finished work and begin to sync", tid);
 
-    g_shared->loader_sync_barrier.sync_and_run_once([]() {
-        for (uint32_t qid = 0; qid < g_query_count; ++qid) {
-            TRACE("outputer begin to wait for query%u", qid);
-            g_queries_done[qid].wait_done();
+//     g_shared->loader_sync_barrier.sync_and_run_once([]() {
+//         for (uint32_t qid = 0; qid < g_query_count; ++qid) {
+//             TRACE("outputer begin to wait for query%u", qid);
+//             g_queries_done[qid].wait_done();
 
-            // print query
-            const query_t& query = g_queries[qid];
-#if defined(MAKE_FASTEST)
-            const size_t cnt = fwrite(query.output, sizeof(char), query.output_size, stdout);
-            CHECK(cnt == query.output_size);
-#endif
-            DEBUG("query%u result length%u, done", qid, query.output_size);
-        }
-        C_CALL(fflush(stdout));
-    });
+//             // print query
+//             const query_t& query = g_queries[qid];
+// #if defined(MAKE_FASTEST)
+//             const size_t cnt = fwrite(query.output, sizeof(char), query.output_size, stdout);
+//             CHECK(cnt == query.output_size);
+// #endif
+//             DEBUG("query%u result length%u, done", qid, query.output_size);
+//         }
+//         C_CALL(fflush(stdout));
+//     });
 
 }
 

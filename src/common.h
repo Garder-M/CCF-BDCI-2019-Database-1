@@ -215,6 +215,8 @@ public:
     std::atomic_uint32_t shared_pretopn_d_ranges_curr { 0 };
     std::atomic_uint32_t pretopn_queries_curr { 0 };
     std::atomic_uint32_t queries_curr { 0 };
+
+    sync_barrier pretopn_sync_barrier { };
 };
 
 class shared_buffer_packer {

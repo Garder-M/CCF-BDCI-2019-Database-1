@@ -199,16 +199,17 @@ static void do_multi_process() noexcept
         (g_is_creating_index ? fn_loader_thread_create_index : fn_loader_thread_use_index)(g_id);
     }
 
-    if (!g_is_creating_index) {
-        pretopn_thread.join();
-    }
-
     //
     // Wait for loader thread
     // ...as well as unloader thread
     //
     worker_thread.join();
     unloader_thread.join();
+    
+    if (!g_is_creating_index) {
+        pretopn_thread.join();
+    }
+
 }
 
 
@@ -312,6 +313,9 @@ int main(int argc, char* argv[])
         DEBUG("g_total_process_count: %u", g_total_process_count);
         g_shared->worker_sync_barrier.init(g_total_process_count, /*use_multi_process*/true);
         g_shared->loader_sync_barrier.init(g_total_process_count, /*use_multi_process*/true);
+        if (!g_is_creating_index) {
+            g_shared->pretopn_sync_barrier.init(g_total_process_count, /*use_multi_process*/true);
+        }
     }
 
 
