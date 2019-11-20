@@ -1335,21 +1335,15 @@ void fn_worker_thread_use_index(const uint32_t tid) noexcept
 
                 const uint32_t value1 = *p;
                 const date_t shipdate1 = base_orderdate + (value1 >> 24);
-                if (shipdate1 > query.q_shipdate) {
-                    total_expend_cent += (value1 & 0x00FFFFFF);
-                }
+                total_expend_cent += (shipdate1 > query.q_shipdate) ? (value1 & 0x00FFFFFF) : 0;
 
                 const uint32_t value2 = *(p + 1);
                 const date_t shipdate2 = base_orderdate + (value2 >> 24);
-                if (shipdate2 > query.q_shipdate) {
-                    total_expend_cent += (value2 & 0x00FFFFFF);
-                }
+                total_expend_cent += (shipdate2 > query.q_shipdate) ? (value2 & 0x00FFFFFF) : 0;
 
                 const uint32_t value3 = *(p + 2);
                 const date_t shipdate3 = base_orderdate + (value3 >> 24);
-                if (shipdate3 > query.q_shipdate) {
-                    total_expend_cent += (value3 & 0x00FFFFFF);
-                }
+                total_expend_cent += (shipdate3 > query.q_shipdate) ? (value3 & 0x00FFFFFF) : 0;
 
                 p += 4;
 
