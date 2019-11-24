@@ -17,7 +17,7 @@
 #define ENABLE_LOGGING_INFO                 1
 #endif
 
-#define ENABLE_CPU_HANDLE_MINOR_WORKLOAD    1
+#define ENABLE_CPU_HANDLE_MINOR_MIDDL_WORKLOAD    1
 
 // Do we use spin_lock in bounded_bag<T> and mpmc_queue<T>?
 //  0 - Use mutex

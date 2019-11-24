@@ -63,7 +63,7 @@ rm -rf /data/index
 1. Reboot the machine to reset system status.
 2. Invoke `run.sh` with queries. It's expected to be slow, because we have to read text files from disk.
 3. Delete the created index `data/index`.
-4. Invoke `run.sh` with queries for many times (like 10 times). During the first run, `data/index` will be generated. For the following runs, it will be must faster since using index.
+4. Invoke `run.sh` with queries for many times (like 10 times). During the first run, `data/index` will be generated. For the following runs, it will be much faster since using index.
 
 All done. The grade should be based on **Step 4**.
 
