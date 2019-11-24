@@ -2,6 +2,7 @@
 /.idea/
 /cmake-build-*/
 build/
+/BDCI19
 
 # Text data files
 /data/customer.*
@@ -13,3 +14,11 @@ index/
 
 # Test output
 /test/*.stdout
+
+# Some files in /data
+/workspace
+/customer.txt
+/orders.txt
+/lineitem.txt
+/lost+found/
+

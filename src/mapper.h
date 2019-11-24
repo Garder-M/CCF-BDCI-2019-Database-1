@@ -156,6 +156,19 @@ void* mmap_allocate_page4k(
 
 [[nodiscard]]
 __always_inline
+void* mmap_allocate_page4k_shared(
+    /*in*/ const size_t size) noexcept
+{
+    return my_mmap(
+        size,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+        -1,
+        0);
+}
+
+[[nodiscard]]
+__always_inline
 void* mmap_allocate_page2m(
     /*in*/ const size_t size) noexcept
 {

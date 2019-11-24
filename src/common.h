@@ -28,8 +28,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/ipc.h>
+#include <sys/uio.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -158,7 +161,12 @@ static_assert(sizeof(query_result_t) == 12);
 #define SHMKEY_ORDERKEY_TO_ORDER    ((key_t)0x19491005)
 #define SHMKEY_ORDERKEY_TO_CUSTKEY  ((key_t)0x19491006)
 #define SHMKEY_QUERY_CONTEXT        ((key_t)0x19491007)
+#define SHMKEY_ITEMS_BUFFER         ((key_t)0x19491008)
 #define SHMKEY_BUFFER_PACKER_BEGIN  ((key_t)0x20191001)
+
+#define ENV_NAME_PREPARING_PAGE_CACHE   "PREPARING_PAGE_CACHE_174066BA074C446BAA8A0350D5120BCE"
+#define ENV_VALUE_PREPARING_PAGE_CACHE  "YES_0858B4395F6E46DCB802123E4A865CB8"
+
 
 //==============================================================================
 // Global Variables
@@ -187,11 +195,14 @@ public:
 
     uint32_t total_buckets = 0;
     uint32_t buckets_per_holder = 0;
+    uint32_t total_plates = 0;
 
     std::atomic_uint64_t next_truncate_holder_major_id { 0 };
+    std::atomic_uint64_t next_truncate_holder_mid_id { 0 };
     std::atomic_uint64_t next_truncate_holder_minor_id { 0 };
 
-    uint32_t total_plates = 0;
+    std::atomic_uint32_t write_tail_bucket_id_shared_counter { 0 };
+    std::atomic_uint32_t only_xxx_max_expend_cent_bucket_id_shared_counter { 0 };
     std::atomic_uint32_t pretopn_plate_id_shared_counter { 0 };
 
     struct {
@@ -207,6 +218,9 @@ public:
     struct {
         uint32_t max_shipdate_orderdate_diff = 0;
         uint64_t max_bucket_size_major = 0;
+#if ENABLE_MID_INDEX
+        uint64_t max_bucket_size_mid = 0;
+#endif
         uint64_t max_bucket_size_minor = 0;
     } meta { };
 
@@ -381,12 +395,6 @@ inline uint32_t g_active_cpu_cores = 0;  // number of CPU cores
 inline uint32_t g_total_process_count = 0;  // process or thread count
 inline uint32_t g_id = 0;
 
-#if ENABLE_SHM_CACHE_TXT
-inline posix_shm_t<char> g_customer_shm { };
-inline posix_shm_t<char> g_orders_shm { };
-inline posix_shm_t<char> g_lineitem_shm { };
-#endif
-
 inline load_file_context g_customer_file { };
 inline load_file_context g_orders_file { };
 inline load_file_context g_lineitem_file { };
@@ -401,8 +409,14 @@ inline const char* const* g_argv_queries = nullptr;
 constexpr const uint32_t BUCKETS_PER_MKTID = __div_up((MAX_TABLE_DATE - MIN_TABLE_DATE + 1), CONFIG_ORDERDATES_PER_BUCKET);
 
 inline load_file_context g_endoffset_file_major { };
+#if ENABLE_MID_INDEX
+inline load_file_context g_endoffset_file_mid { };
+#endif
 inline load_file_context g_endoffset_file_minor { };
 inline int g_holder_files_major_fd[CONFIG_INDEX_HOLDER_COUNT] { };
+#if ENABLE_MID_INDEX
+inline int g_holder_files_mid_fd[CONFIG_INDEX_HOLDER_COUNT] { };
+#endif
 inline int g_holder_files_minor_fd[CONFIG_INDEX_HOLDER_COUNT] { };
 
 
@@ -410,12 +424,18 @@ static_assert(CONFIG_TOPN_DATES_PER_PLATE % CONFIG_ORDERDATES_PER_BUCKET == 0);
 constexpr const uint32_t BUCKETS_PER_PLATE = CONFIG_TOPN_DATES_PER_PLATE / CONFIG_ORDERDATES_PER_BUCKET;
 constexpr const uint32_t PLATES_PER_MKTID = __div_up(BUCKETS_PER_MKTID, BUCKETS_PER_PLATE);
 
+#if ENABLE_MID_INDEX
+inline load_file_context g_only_mid_max_expend_file { };
+#endif
 inline load_file_context g_only_minor_max_expend_file { };
 inline load_file_context g_pretopn_file { };
 inline load_file_context g_pretopn_count_file { };
 
 inline uint64_t* g_pretopn_start_ptr = nullptr;  // [g_shared->total_plates][CONFIG_EXPECT_MAX_TOPN]
 inline uint32_t* g_pretopn_count_start_ptr = nullptr;  // [g_shared->total_plates]
+#if ENABLE_MID_INDEX
+inline uint32_t* g_only_mid_max_expend_start_ptr = nullptr;  // [g_shared->total_buckets]
+#endif
 inline uint32_t* g_only_minor_max_expend_start_ptr = nullptr;  // [g_shared->total_buckets]
 
 
@@ -424,7 +444,6 @@ inline uint32_t* g_only_minor_max_expend_start_ptr = nullptr;  // [g_shared->tot
 //==============================================================================
 void fn_loader_thread_create_index(const uint32_t tid) noexcept;
 void fn_worker_thread_create_index(const uint32_t tid) noexcept;
-void fn_unloader_thread_create_index() noexcept;
 void create_index_initialize_before_fork() noexcept;
 void create_index_initialize_after_fork() noexcept;
 
@@ -435,7 +454,6 @@ void create_index_initialize_after_fork() noexcept;
 void fn_pretopn_thread_use_index(const uint32_t tid) noexcept;
 void fn_loader_thread_use_index(const uint32_t tid) noexcept;
 void fn_worker_thread_use_index(const uint32_t tid) noexcept;
-void fn_unloader_thread_use_index() noexcept;
 void use_index_initialize_before_fork() noexcept;
 void use_index_initialize_after_fork() noexcept;
 
@@ -531,6 +549,58 @@ void set_thread_fifo_scheduler(const uint32_t nice_from_max_priority) noexcept
     const int err = PTHREAD_CALL_NO_PANIC(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param));
     if (err != 0) {
         g_shared->sched_fifo_failed = true;
+    }
+}
+
+
+template<char _Delimiter>
+__always_inline
+uint32_t __parse_u32(const char* s) noexcept
+{
+    uint32_t result = 0;
+    do {
+        ASSERT(*s >= '0' && *s <= '9', "Unexpected char: %c", *s);
+        result = result * 10 + (*s - '0');
+        ++s;
+    } while (*s != _Delimiter);
+    return result;
+}
+
+template<typename T, typename TComp>
+__always_inline
+void modify_heap(T* const begin, const size_t count, const T& new_value, TComp comp) noexcept
+{
+    ASSERT(count > 0);
+    begin[0] = new_value;
+
+    T* const base = begin - 1;
+    size_t pos = 1;
+    while ((pos << 1 | 1) <= count) {
+        if (comp(base[pos << 1], base[pos << 1 | 1])) {  // check to swap with right child
+            if (comp(base[pos], base[pos << 1 | 1])) {
+                std::swap(base[pos], base[pos << 1 | 1]);
+                pos = pos << 1 | 1;
+            }
+            else {
+                return;
+            }
+        }
+        else {  // check to swap with left child
+            if (comp(base[pos], base[pos << 1])) {
+                std::swap(base[pos], base[pos << 1]);
+                pos = pos << 1;
+            }
+            else {
+                return;
+            }
+        }
+    }
+
+    // Now (pos << 1 | 1) > count
+    if ((pos << 1) <= count) {
+        if (comp(base[pos], base[pos << 1])) {
+            std::swap(base[pos], base[pos << 1]);
+        }
     }
 }
 

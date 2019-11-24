@@ -43,6 +43,35 @@ public:
         *item = _items[(_head++) % _Capacity];
     }
 
+    __always_inline bool try_take(/*out*/ T* item) noexcept
+    {
+        if (!_sem_pop.try_wait()) {
+            return false;
+        }
+
+        ASSERT(_head < _tail);
+        *item = _items[(_head++) % _Capacity];
+
+        return true;
+    }
+
+    __always_inline void return_back_many(/*in*/ const T* const items, const size_t cnt) noexcept
+    {
+        if (__unlikely(cnt == 0)) return;
+
+        {
+            std::unique_lock<decltype(_lock)> lock(_lock);
+            ASSERT(_head <= _tail);
+
+            for (size_t i = 0; i < cnt; ++i) {
+                _items[(_tail++) % _Capacity] = items[i];
+            }
+        }
+
+        ASSERT(cnt < (size_t)INT32_MAX);
+        _sem_pop.post((uint32_t)cnt);
+    }
+
     __always_inline void return_back(/*in*/ const T& item) noexcept
     {
         {
@@ -132,6 +161,17 @@ public:
         return _Capacity;
     }
 
+    void unsafe_for_each(const std::function<void(T&)>& func) noexcept
+    {
+        ASSERT(func);
+
+        const size_t head = _head;
+        const size_t tail = _tail;
+        for (size_t i = head; i < tail; ++i) {
+            func(_items[i % _Capacity]);
+        }
+    }
+
 private:
     T _items[_Capacity];
     process_private_semaphore _sem_pop { 0 };
@@ -205,6 +245,32 @@ public:
         *item = _items[head % _Capacity];
 
         return true;
+    }
+
+    __always_inline bool try_pop(/*out*/ T* item) noexcept
+    {
+        if (!_sem.try_wait()) {
+            return false;
+        }
+
+        // NOTE:
+        //  We explicitly allow calling pop() before calling init()
+        //  Thus, this assertion should go after sem_wait()
+        ASSERT(_items != nullptr, "BUG: _items == nullptr. init() not called? head=%lu, tail=%lu",
+            _head.load(), _tail.load());
+
+        const size_t head = _head++;
+        const size_t tail = _tail.load();
+        ASSERT(head < tail);
+
+        *item = _items[head % _Capacity];
+
+        return true;
+    }
+
+    __always_inline bool approx_empty() noexcept
+    {
+        return (_head.load() == _tail.load());
     }
 
     __always_inline void mark_push_finish(const uint32_t max_consumer_threads) noexcept

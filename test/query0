@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -e
+
+cd "$(dirname "$0")"
+
+time taskset -c 0-15 ../run.sh \
+    ../data/customer.txt ../data/orders.txt ../data/lineitem.txt \
+    0 \
+    \
+    >"$(basename "$0").stdout"
+
+echo
+diff "$(basename "$0").stdout" "$(basename "$0").result"
+

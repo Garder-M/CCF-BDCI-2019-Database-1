@@ -72,16 +72,12 @@ bool __fincore(
 
 
 __always_inline
-#if ENABLE_SHM_CACHE_TXT
-void __open_file_read_direct(
-#else  // !ENABLE_SHM_CACHE_TXT
 void __open_file_read(
-#endif  // ENABLE_SHM_CACHE_TXT
     /*in*/ const char *const path,
     /*out*/ load_file_context *const ctx) noexcept
 {
     ASSERT(ctx->fd == -1, "fd should be initialized to -1 to prevent bugs");
-    ctx->fd = C_CALL(open(path, O_RDONLY | O_CLOEXEC | (ENABLE_SHM_CACHE_TXT ? O_DIRECT : 0)));
+    ctx->fd = C_CALL(open(path, O_RDONLY | O_CLOEXEC));
 
     struct stat64 st; // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
     C_CALL(fstat64(ctx->fd, &st));
@@ -92,11 +88,7 @@ void __open_file_read(
 
 
 __always_inline
-#if ENABLE_SHM_CACHE_TXT
-void __openat_file_read_direct(
-#else  // !ENABLE_SHM_CACHE_TXT
 void __openat_file_read(
-#endif  // ENABLE_SHM_CACHE_TXT
     /*in*/ const int dir_fd,
     /*in*/ const char *const name,
     /*out*/ load_file_context *const ctx) noexcept
@@ -105,7 +97,7 @@ void __openat_file_read(
     ctx->fd = C_CALL(openat(
         dir_fd,
         name,
-        O_RDONLY | O_CLOEXEC | (ENABLE_SHM_CACHE_TXT ? O_DIRECT : 0)));
+        O_RDONLY | O_CLOEXEC));
 
     struct stat64 st; // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
     C_CALL(fstat64(ctx->fd, &st));

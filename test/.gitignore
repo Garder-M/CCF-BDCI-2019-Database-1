@@ -1,5 +1,6 @@
 *.stdout
 huge_*.result
+final_*.result
 
 *.stackdump
 

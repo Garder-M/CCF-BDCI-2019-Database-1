@@ -31,10 +31,16 @@ constexpr const uint32_t __max_table_date_u32 = __date_u32_from_ymd(__max_table_
 static_assert(__max_table_date_u32 > __min_table_date_u32);
 static_assert(__max_table_date_u32 - __min_table_date_u32 + 1 < INT16_MAX);
 
-
-template<bool _Unchecked>
+template<bool _DontCheck>
 __always_inline
 constexpr date_t date_from_ymd(
+    /*in*/ const uint32_t year,
+    /*in*/ const uint32_t month,
+    /*in*/ const uint32_t day) noexcept;
+
+template<>
+__always_inline
+constexpr date_t date_from_ymd</*_DontCheck*/false>(
     /*in*/ const uint32_t year,
     /*in*/ const uint32_t month,
     /*in*/ const uint32_t day) noexcept
@@ -46,21 +52,43 @@ constexpr date_t date_from_ymd(
 
     const uint32_t value = __date_u32_from_ymd(year, month, day);
 
-    if constexpr (_Unchecked) {
-#if !defined(__INTEL_COMPILER)
-        ASSERT(value >= __min_table_date_u32);
-        ASSERT(value <= __max_table_date_u32);
-#endif
-    }
-    else {
-        if (value < __min_table_date_u32)
-            return 0;
-        else if (value > __max_table_date_u32)
-            return (__max_table_date_u32 - __min_table_date_u32 + 1 + 1);
-    }
+    if (value < __min_table_date_u32)
+        return 0;
+    else if (value > __max_table_date_u32)
+        return (__max_table_date_u32 - __min_table_date_u32 + 1 + 1);
 
     return value - __min_table_date_u32 + 1;
 }
+
+//template<bool _DontCheck>
+//__always_inline
+//constexpr date_t date_from_ymd(
+//    /*in*/ const uint32_t year,
+//    /*in*/ const uint32_t month,
+//    /*in*/ const uint32_t day) noexcept
+//{
+//#if !defined(__INTEL_COMPILER)
+//    ASSERT(month > 0 && month <= 12, "Unexpected month: %u", month);
+//    ASSERT(day > 0 && day <= 31, "Unexpected day: %u", day);
+//#endif
+//
+//    const uint32_t value = __date_u32_from_ymd(year, month, day);
+//
+//    if constexpr (_DontCheck) {
+//#if !defined(__INTEL_COMPILER)
+//        ASSERT(value >= __min_table_date_u32);
+//        ASSERT(value <= __max_table_date_u32);
+//#endif
+//    }
+//    else {
+//        if (value < __min_table_date_u32)
+//            return 0;
+//        else if (value > __max_table_date_u32)
+//            return (__max_table_date_u32 - __min_table_date_u32 + 1 + 1);
+//    }
+//
+//    return value - __min_table_date_u32 + 1;
+//}
 
 constexpr const date_t MIN_TABLE_DATE = (date_from_ymd<false>(__min_table_year, 1, 1));
 constexpr const date_t MAX_TABLE_DATE = (date_from_ymd<false>(__max_table_year, 12, 31));
@@ -68,9 +96,13 @@ static_assert(MIN_TABLE_DATE == 1);
 static_assert(MAX_TABLE_DATE == 2557);
 
 
-template<bool _Unchecked>
+template<bool _DontCheck>
 __always_inline
-constexpr date_t __date_from_string(const char (&s)[11]) noexcept
+constexpr date_t __date_from_string(const char (&s)[11]) noexcept;
+
+template<>
+__always_inline
+constexpr date_t __date_from_string</*_DontCheck*/false>(const char (&s)[11]) noexcept
 {
     // Format of `s`: yyyy-MM-dd
 #if !defined(__INTEL_COMPILER)
@@ -83,14 +115,46 @@ constexpr date_t __date_from_string(const char (&s)[11]) noexcept
     const uint32_t month = (s[5] - '0') * 10u + (s[6] - '0');
     const uint32_t day = (s[8] - '0') * 10u + (s[9] - '0');
 
-    return date_from_ymd<_Unchecked>(year, month, day);
+    return date_from_ymd<false>(year, month, day);
 }
 
-template<bool _Unchecked>
+template<>
+__always_inline
+constexpr date_t __date_from_string</*_DontCheck*/true>(const char (&s)[11]) noexcept
+{
+    // Format of `s`: yyyy-MM-dd
+#if !defined(__INTEL_COMPILER)
+    ASSERT(s[0] == '1');
+    ASSERT(s[1] == '9');
+    ASSERT(s[2] == '9');
+    ASSERT(s[3] >= '2' && s[3] <= '8');
+    ASSERT(s[4] == '-', "Expect '-' char at date s[4] but got: %c (0x%02x)", s[4], s[4]);
+    ASSERT(s[5] >= '0' && s[5] <= '1');
+    ASSERT(s[6] >= '0' && s[6] <= '9');
+    ASSERT(s[7] == '-', "Expect '-' char at date s[7] but got: %c (0x%02x)", s[7], s[7]);
+    ASSERT(s[8] >= '0' && s[8] <= '3');
+    ASSERT(s[9] >= '0' && s[9] <= '9');
+    ASSERT(s[10] == '\n' || s[10] == '\0' || s[10] == '|', "Unexpected char after date: %c (0x%02x)", s[10], s[10]);
+#endif
+
+    uint32_t month = (s[5] - '0') * 10u + (s[6] - '0');
+    const uint32_t day = (s[8] - '0') * 10u + (s[9] - '0');
+
+    static_assert(__min_table_date_u32 == 727503);
+
+    const uint32_t tmp = (s[3] - '2' - (month < 3));
+    month = (month + 9) % 12;
+    const int32_t value = (month * 306 + 5) / 10 + tmp * 365 + tmp / 4 + day + 60;
+
+    return value;
+}
+
+
+template<bool _DontCheck>
 __always_inline
 date_t date_from_string(const char* const s) noexcept
 {
-    return __date_from_string<_Unchecked>(*static_cast<const char(*)[11]>((void*)s));
+    return __date_from_string<_DontCheck>(*static_cast<const char(*)[11]>((void*)s));
 }
 
 __always_inline
@@ -155,6 +219,16 @@ static_assert(__date_from_string<false>("1999-01-01") == 2558);
 static_assert(__date_from_string<false>("1999-01-02") == 2558);
 static_assert(__date_from_string<false>("2019-12-31") == 2558);
 static_assert(__date_from_string<false>("9999-12-31") == 2558);
+
+static_assert(__date_from_string<true>("1992-01-01") == 1);
+static_assert(__date_from_string<true>("1992-01-02") == 2);
+static_assert(__date_from_string<true>("1992-01-31") == 31);
+static_assert(__date_from_string<true>("1992-02-01") == 32);
+static_assert(__date_from_string<true>("1992-02-29") == 60);
+static_assert(__date_from_string<true>("1992-03-01") == 61);
+static_assert(__date_from_string<true>("1993-01-01") == 367);
+static_assert(__date_from_string<true>("1998-12-30") == 2556);
+static_assert(__date_from_string<true>("1998-12-31") == 2557);
 
 // According to TPC-H spec v2.18.0 chap 4.2.3, shipdate = orderdate + random[1..121]
 // So, 7 bit is enough to represent the difference between shipdate and orderdate

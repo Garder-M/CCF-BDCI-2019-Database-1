@@ -1,6 +1,16 @@
 #include "common.h"
 
 
+struct final_prepare_page_cache_context_t
+{
+    done_event map_customer_done { };
+    done_event map_orders_done { };
+    done_event map_lineitem_done { };
+
+    done_event can_exit { };
+};
+
+
 static void detect_preparing_page_cache() noexcept
 {
     ASSERT(g_orders_file.file_size > 0);
@@ -12,84 +22,210 @@ static void detect_preparing_page_cache() noexcept
     const uint32_t nr_2mb = mem_get_nr_hugepages_2048kB();
     DEBUG("nr_hugepages (2048kB): %u", nr_2mb);
 
-#if ENABLE_SHM_CACHE_TXT
-    const uint32_t require_nr_2mb =
-        __div_up(g_customer_file.file_size, 1024 * 1024 * 2) +
-        __div_up(g_orders_file.file_size, 1024 * 1024 * 2) +
-        __div_up(g_lineitem_file.file_size, 1024 * 1024 * 2) +
-        CONFIG_EXTRA_HUGE_PAGES;
-#else
-    const uint32_t require_nr_2mb = CONFIG_EXTRA_HUGE_PAGES;
-#endif
-    DEBUG("require_nr_2mb: %u", require_nr_2mb);
+    if (nr_2mb != CONFIG_EXTRA_HUGE_PAGES) {
+        // Try to allocate CONFIG_EXTRA_HUGE_PAGES huge pages
+        bool success = mem_set_nr_hugepages_2048kB(CONFIG_EXTRA_HUGE_PAGES);
+        CHECK(success, "Can't write to /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages");
 
-    if (nr_2mb == require_nr_2mb) {
-        do {
-#if ENABLE_SHM_CACHE_TXT
-            if (!g_customer_shm.init_fixed(SHMKEY_TXT_CUSTOMER, g_customer_file.file_size, false)) {
-                break;
-            }
-            if (!g_orders_shm.init_fixed(SHMKEY_TXT_ORDERS, g_orders_file.file_size, false)) {
-                break;
-            }
-            if (!g_lineitem_shm.init_fixed(SHMKEY_TXT_LINEITEM, g_lineitem_file.file_size, false)) {
-                break;
-            }
-#else  // !ENABLE_SHM_CACHE_TXT
-            // Test are txt files in page cache?
-            const auto is_file_in_page_cache = [](const load_file_context& ctx) {
-                ASSERT(ctx.fd > 0);
-                ASSERT(ctx.file_size > 0);
+        uint32_t real_nr_2mb = mem_get_nr_hugepages_2048kB();
+        if (real_nr_2mb != CONFIG_EXTRA_HUGE_PAGES) {
+            ASSERT(real_nr_2mb < CONFIG_EXTRA_HUGE_PAGES);
+            INFO("required %u huge pages, but actually allocated %u: drop page caches and try again",
+                 CONFIG_EXTRA_HUGE_PAGES, real_nr_2mb);
+            success = mem_drop_cache();
+            CHECK(success, "Can't drop page caches");
 
-                constexpr const uint64_t CHECK_SIZE = 1048576;
-                void* const ptr = mmap_reserve_space(CHECK_SIZE);
+            success = mem_set_nr_hugepages_2048kB(CONFIG_EXTRA_HUGE_PAGES);
+            CHECK(success, "Can't write to /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages");
 
-                bool result = false;
-                do {
-                    if (!__fincore(ptr, ctx.fd, 0, CHECK_SIZE)) {
-                        break;
-                    }
-                    if (!__fincore(ptr, ctx.fd, __align_down(ctx.file_size / 2, PAGE_SIZE), CHECK_SIZE)) {
-                        break;
-                    }
-                    if (!__fincore(ptr, ctx.fd, __align_down(ctx.file_size - CHECK_SIZE, PAGE_SIZE), CHECK_SIZE)) {
-                        break;
-                    }
-                    result = true;
-                } while(false);
-
-                C_CALL(munmap(ptr, CHECK_SIZE));
-                mmap_return_space(ptr, ctx.file_size);
-
-                return result;
-            };
-
-            if (!is_file_in_page_cache(g_customer_file)) break;
-            INFO("is_file_in_page_cache(g_customer_file): true");
-
-            if (!is_file_in_page_cache(g_orders_file)) break;
-            INFO("is_file_in_page_cache(g_orders_file): true");
-
-            if (!is_file_in_page_cache(g_lineitem_file)) break;
-            INFO("is_file_in_page_cache(g_lineitem_file): true");
-
-#endif  // ENABLE_SHM_CACHE_TXT
-            g_is_preparing_page_cache = false;
-        } while(false);
+            real_nr_2mb = mem_get_nr_hugepages_2048kB();
+            CHECK(real_nr_2mb == CONFIG_EXTRA_HUGE_PAGES,
+                "Still can't allocate enough huge pages: required %u huge pages, but actually allocated %u",
+                CONFIG_EXTRA_HUGE_PAGES, real_nr_2mb);
+        }
     }
-    else {
-        DEBUG("nr_hugepages != require_nr_2mb (%u != %u)", nr_2mb, require_nr_2mb);
-    }
+
+    do {
+        // Test are txt files in page cache?
+        const auto is_file_in_page_cache = [](const load_file_context& ctx) {
+            ASSERT(ctx.fd > 0);
+            ASSERT(ctx.file_size > 0);
+
+            constexpr const uint64_t CHECK_SIZE = 1048576;
+            void* const ptr = mmap_reserve_space(CHECK_SIZE);
+
+            bool result = false;
+            do {
+                if (!__fincore(ptr, ctx.fd, 0, CHECK_SIZE)) {
+                    break;
+                }
+                if (!__fincore(ptr, ctx.fd, __align_down(ctx.file_size / 2, PAGE_SIZE), CHECK_SIZE)) {
+                    break;
+                }
+                if (!__fincore(ptr, ctx.fd, __align_down(ctx.file_size - CHECK_SIZE, PAGE_SIZE), CHECK_SIZE)) {
+                    break;
+                }
+                result = true;
+            } while(false);
+
+            C_CALL(munmap(ptr, CHECK_SIZE));
+            mmap_return_space(ptr, ctx.file_size);
+
+            return result;
+        };
+
+        if (!is_file_in_page_cache(g_customer_file)) break;
+        INFO("is_file_in_page_cache(g_customer_file): true");
+
+        if (!is_file_in_page_cache(g_orders_file)) break;
+        INFO("is_file_in_page_cache(g_orders_file): true");
+
+        if (!is_file_in_page_cache(g_lineitem_file)) break;
+        INFO("is_file_in_page_cache(g_lineitem_file): true");
+
+        g_is_preparing_page_cache = false;
+
+    } while(false);
 
     INFO("g_is_preparing_page_cache: %d", (int)g_is_preparing_page_cache);
+}
 
-    // TODO
-    if (g_is_preparing_page_cache) {
-#if ENABLE_SHM_CACHE_TXT
-        PANIC("TODO: preparing page cache not implemented yet!");
-#else
-        // Do nothing
-#endif
+
+[[noreturn]]
+static void final_prepare_page_cache_customer(final_prepare_page_cache_context_t* const ctx) noexcept
+{
+    INFO("final_prepare_page_cache_customer() starts");
+
+    ASSERT(g_customer_file.fd > 0);
+    ASSERT(g_customer_file.file_size > 0);
+
+    void* const ptr = my_mmap(
+        g_customer_file.file_size,
+        PROT_READ,
+        MAP_PRIVATE | MAP_POPULATE | MAP_LOCKED,
+        g_customer_file.fd,
+        0);
+    CHECK(ptr != nullptr);
+    INFO("customer txt mapped to %p", ptr);
+
+    C_CALL(mlock(ptr, g_customer_file.file_size));
+    ctx->map_customer_done.mark_done();
+
+    INFO("done final_prepare_page_cache_customer()");
+
+    ctx->can_exit.wait_done();
+    exit(0);
+}
+
+[[noreturn]]
+static void final_prepare_page_cache_orders(final_prepare_page_cache_context_t* const ctx) noexcept
+{
+    INFO("final_prepare_page_cache_orders() starts");
+
+    ASSERT(g_orders_file.fd > 0);
+    ASSERT(g_orders_file.file_size > 0);
+
+    // Try to populate orders txt file after customer and lineitem file done
+    // So orders txt file should occupy index's page cache
+    ctx->map_customer_done.wait_done();
+    ctx->map_lineitem_done.wait_done();
+
+    void* const ptr = my_mmap(
+        g_orders_file.file_size,
+        PROT_READ,
+        MAP_SHARED | MAP_POPULATE | MAP_LOCKED,
+        g_orders_file.fd,
+        0);
+    CHECK(ptr != nullptr);
+    INFO("orders txt mapped to %p", ptr);
+
+    C_CALL(mlock(ptr, g_orders_file.file_size));
+    ctx->map_orders_done.mark_done();
+
+    INFO("done final_prepare_page_cache_orders()");
+
+    ctx->can_exit.wait_done();
+    exit(0);
+}
+
+[[noreturn]]
+static void final_prepare_page_cache_lineitem(final_prepare_page_cache_context_t* const ctx) noexcept
+{
+    INFO("final_prepare_page_cache_lineitem() starts");
+
+    ASSERT(g_lineitem_file.fd > 0);
+    ASSERT(g_lineitem_file.file_size > 0);
+
+    void* const ptr = my_mmap(
+        g_lineitem_file.file_size,
+        PROT_READ,
+        MAP_SHARED | MAP_POPULATE | MAP_LOCKED,
+        g_lineitem_file.fd,
+        0);
+    CHECK(ptr != nullptr);
+    INFO("lineitem txt mapped to %p", ptr);
+
+    C_CALL(mlock(ptr, g_lineitem_file.file_size));
+    ctx->map_lineitem_done.mark_done();
+
+    INFO("done final_prepare_page_cache_lineitem()");
+
+    ctx->can_exit.wait_done();
+    exit(0);
+}
+
+
+
+static void final_prepare_page_cache() noexcept
+{
+    ASSERT(g_index_directory_fd > 0);
+    ASSERT(g_customer_file.file_size > 0);
+    ASSERT(g_customer_file.fd > 0);
+    ASSERT(g_orders_file.file_size > 0);
+    ASSERT(g_orders_file.fd > 0);
+    ASSERT(g_lineitem_file.file_size > 0);
+    ASSERT(g_lineitem_file.fd > 0);
+
+    final_prepare_page_cache_context_t* const ctx = (final_prepare_page_cache_context_t*)mmap_allocate_page4k_shared(
+        sizeof(final_prepare_page_cache_context_t));
+    ASSERT(ctx != nullptr);
+    new (ctx) final_prepare_page_cache_context_t;
+
+    //
+    // Fork 3 child process to load customer, orders, lineitem file
+    //
+    if (fork() == 0) {  // child 1
+        final_prepare_page_cache_customer(ctx);
+    }
+    else if (fork() == 0) {  // child 2
+        final_prepare_page_cache_orders(ctx);
+    }
+    else if (fork() == 0) {  // child 3
+        final_prepare_page_cache_lineitem(ctx);
+    }
+    else {  // parent process
+        ctx->map_customer_done.wait_done();
+        ctx->map_orders_done.wait_done();
+        ctx->map_lineitem_done.wait_done();
+
+        // Now clear all other page caches!
+        INFO("final_prepare_page_cache: now mem_drop_cache()");
+        const bool success = mem_drop_cache();
+        if (!success) {
+            WARN("final_prepare_page_cache: mem_drop_cache() failed! Performance may drop significantly");
+        }
+
+        // Now we allows exit...
+        INFO("final_prepare_page_cache: now can_exit");
+        ctx->can_exit.mark_done();
+
+        for (uint32_t i = 0; i < 3; ++i) {
+            int status;
+            C_CALL(wait(&status));
+            CHECK(WIFEXITED(status), "final_prepare_page_cache: One of child process not normally exits");
+            CHECK(WEXITSTATUS(status) == 0, "final_prepare_page_cache: One of child process exits with %d", WEXITSTATUS(status));
+        }
+        INFO("final_prepare_page_cache: 3 child processes exits normally");
     }
 }
 
@@ -147,7 +283,7 @@ static void do_multi_process() noexcept
 
 
     //
-    // Create worker thread, unloader thread
+    // Create worker thread
     //
     std::thread worker_thread;
     std::thread unloader_thread;
@@ -201,7 +337,6 @@ static void do_multi_process() noexcept
 
     //
     // Wait for loader thread
-    // ...as well as unloader thread
     //
     worker_thread.join();
     unloader_thread.join();
@@ -239,6 +374,7 @@ int main(int argc, char* argv[])
         else if (errno == ENOENT) {
             g_is_creating_index = true;
             DEBUG("index directory not found... now creating index");
+            umask(0);  // always succeeds
             C_CALL(mkdir(index_dir, 0777));  // so we don't require sudo to `rm -rf index`
             g_index_directory_fd = C_CALL(open(index_dir, O_DIRECTORY | O_PATH | O_CLOEXEC));
         }
@@ -258,17 +394,33 @@ int main(int argc, char* argv[])
         const char* const orders_text_path = argv[2];
         const char* const lineitem_text_path = argv[3];
 
-#if ENABLE_SHM_CACHE_TXT
-        __open_file_read_direct(customer_text_path, &g_customer_file);
-        __open_file_read_direct(orders_text_path, &g_orders_file);
-        __open_file_read_direct(lineitem_text_path, &g_lineitem_file);
-#else
         __open_file_read(customer_text_path, &g_customer_file);
         __open_file_read(orders_text_path, &g_orders_file);
         __open_file_read(lineitem_text_path, &g_lineitem_file);
-#endif
 
         detect_preparing_page_cache();
+    }
+    else {
+        g_is_preparing_page_cache = false;
+
+        // Detect whether we are preparing page cache by check the environment variable
+        const char* const env_value = getenv(ENV_NAME_PREPARING_PAGE_CACHE);
+        if (env_value != nullptr) {
+            if (strcmp(env_value, ENV_VALUE_PREPARING_PAGE_CACHE) == 0) {
+                g_is_preparing_page_cache = true;
+                INFO("use_index: g_is_preparing_page_cache is true!");
+            }
+        }
+
+        if (g_is_preparing_page_cache) {
+            const char* const customer_text_path = argv[1];
+            const char* const orders_text_path = argv[2];
+            const char* const lineitem_text_path = argv[3];
+
+            __open_file_read(customer_text_path, &g_customer_file);
+            __open_file_read(orders_text_path, &g_orders_file);
+            __open_file_read(lineitem_text_path, &g_lineitem_file);
+        }
     }
 
 
@@ -276,12 +428,7 @@ int main(int argc, char* argv[])
     // Initialize g_shared
     //
     {
-        g_shared = (shared_information_t*)my_mmap(
-            sizeof(shared_information_t),
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
-            -1,
-            0);
+        g_shared = (shared_information_t*)mmap_allocate_page4k_shared(sizeof(shared_information_t));
         DEBUG("g_shared: %p", g_shared);
 
         new (g_shared) shared_information_t;
@@ -293,11 +440,11 @@ int main(int argc, char* argv[])
     //
     {
         // Get query count
-        g_query_count = (uint32_t) std::strtoul(argv[4], nullptr, 10);
+        g_query_count = __parse_u32<'\0'>(argv[4]);
         DEBUG("g_query_count: %u", g_query_count);
         g_argv_queries = &argv[5];
-        if (!g_is_creating_index && __unlikely(g_query_count == 0)) {
-            INFO("!is_creating_index && g_query_count == 0: fast exit!");
+        if (!g_is_creating_index && __unlikely(g_query_count == 0) && !g_is_preparing_page_cache) {
+            INFO("!is_creating_index && g_query_count == 0 && !g_is_preparing_page_cache: fast exit!");
             return 0;
         }
 
@@ -319,8 +466,44 @@ int main(int argc, char* argv[])
     }
 
 
-    do_multi_process();
+    if (g_is_creating_index || g_query_count > 0) {
+        do_multi_process();
+        if (g_id != (uint32_t)-1) {
+            INFO("[%u] child process exits", g_id);
+            return 0;
+        }
+    }
+    else {
+        ASSERT(!g_is_creating_index);  // currently use_index
+        ASSERT(g_query_count == 0);
+        ASSERT(g_is_preparing_page_cache);  // we must be preparing page cache
+    }
 
-    INFO("======== exit ========");
+
+    //
+    // Exit main process now
+    //
+    if (g_is_creating_index) {
+        if (g_is_preparing_page_cache) {
+            C_CALL(setenv(ENV_NAME_PREPARING_PAGE_CACHE, ENV_VALUE_PREPARING_PAGE_CACHE, true));
+        }
+
+        char** args = new char*[argc + 1];
+        for (int i = 0; i < argc; ++i) {
+            args[i] = argv[i];
+        }
+        args[argc] = nullptr;
+        INFO("================ now exec! ================");
+        C_CALL(execv(argv[0], args));
+    }
+    else {
+        if (g_is_preparing_page_cache) {
+            INFO("now prepare page cache!");
+            final_prepare_page_cache();
+        }
+
+        INFO("================ now exit! ================");
+    }
+
     return 0;
 }
